@@ -1,4 +1,4 @@
-﻿canceled,latitude,longitude,address,city,state,title,facility,telehealth,start_time,stop_time,start_date,end_date,parking_date,parking_time,medical,dental,vision,dentures,url
+﻿canceled,lat,lng,address,city,state,title,facility,telehealth,start_time,stop_time,start_date,end_date,parking_date,parking_time,medical,dental,vision,dentures,url
 No,36.34693,-84.15976,"2221 Jacksboro Pike, LaFollette, TN  37766",LaFollette,TN,Food City # 661 LaFollette (Telehealth),Food City # 661,Yes,12:00 PM,4:00pm,11/13/2025,11/13/2025,11/13/2025,,,,,,
 No,35.97232,-83.92255,"519 Williams St, Knoxville, TN  37919",Knoxville,TN,CareCuts (Telehealth),CareCuts,Yes,10:00 AM,2:00 PM,11/18/2025,11/18/2025,11/18/2025,,,,,,
 No,35.43025,-84.57638,"407 New Englewood, Athens, TN  37303",Athens,TN,Better Living (Telehealth),"Better Living Center- Seventh Day Adventist Church, Athens",Yes,10:00am,2:00pm,11/18/2025,11/18/2025,11/18/2025,,,,,,
