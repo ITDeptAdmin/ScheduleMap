@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# scripts/sync_mec_to_csv.py
 """
 Sync Modern Events Calendar (MEC) events to a GitHub-tracked CSV.
 
@@ -11,14 +12,23 @@ Optional env vars (recommended):
 - MEC_START: YYYY-MM-DD (default: 2026-01-01)
 - MEC_END:   YYYY-MM-DD (default: 2027-12-31)
 - MEC_LIMIT: int (default: 200)
+- MAX_SPAN_DAYS: int (default: 10)  # skips suspiciously long occurrences from repeat rules
 - MEC_DEBUG: "1" to print basic diagnostics (no secrets)
 
 What it does:
-- Fetches events from /events using start/end/limit
-- Fetches each event detail from /events/{id}
-- Pulls location data from "locations" block
-- Pulls Services/Clinic Type/parking_date/parking_time from "fields"
-- Preserves existing CSV header if CSV file exists
+- Fetches event IDs from /events using start/end/limit
+- Fetches full details from /events/{id}
+- Writes one CSV row per occurrence in data.dates[]
+- Fills:
+  - location: facility/address/city/state/lat/lng
+  - site: "City, State" (if column exists)
+  - dates: start_date/end_date
+  - times: start_time/stop_time (blank for all-day)
+  - services: medical/dental/vision/dentures from custom fields (fallback to content scan)
+  - telehealth: from custom field "Clinic Type" (fallback to content scan)
+  - parking_date/parking_time from custom fields
+  - canceled: from meta.mec_event_status containing "cancel"
+- Preserves existing CSV header/order if CSV already exists
 """
 
 from __future__ import annotations
@@ -26,7 +36,8 @@ from __future__ import annotations
 import csv
 import os
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -193,8 +204,8 @@ def _clinic_type_flags(clinic_type_value: str, fallback_text: str = "") -> Dict[
         return word.lower() in source.lower()
 
     return {
-        "popup": has("popup"),
         "telehealth": has("telehealth"),
+        "popup": has("popup"),
     }
 
 
@@ -216,25 +227,123 @@ def _extract_location(event_data: Dict[str, Any]) -> Dict[str, str]:
         "lat": str(loc.get("latitude", "")).strip(),
         "lng": str(loc.get("longitude", "")).strip(),
         "opening_hour": str(loc.get("opening_hour", "")).strip(),
+        "postal_code": str(loc.get("postal_code", "")).strip(),
     }
 
 
-def _extract_dates(event_data: Dict[str, Any]) -> List[Tuple[str, str]]:
+def _parse_ymd(s: str) -> Optional[date]:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _format_time_from_parts(hour: Any, minutes: Any, ampm: Any) -> str:
+    """
+    MEC often returns: hour="1", minutes="0", ampm="PM"
+    Output: "1:00 pm"
+    """
+    if hour in (None, "", 0, "0"):
+        return ""
+    try:
+        h = int(str(hour).strip())
+    except Exception:
+        return ""
+
+    try:
+        m = int(str(minutes).strip()) if minutes not in (None, "") else 0
+    except Exception:
+        m = 0
+
+    ap = str(ampm or "").strip().lower()
+    if ap not in {"am", "pm"}:
+        return ""
+
+    return f"{h}:{m:02d} {ap}"
+
+
+def _extract_occurrences(event_data: Dict[str, Any], max_span_days: int) -> List[Dict[str, str]]:
+    """
+    Returns list of occurrence dicts:
+    - start_date, end_date, start_time, stop_time
+    Skips suspicious long spans (repeat artifacts) beyond max_span_days.
+    """
     dates = event_data.get("dates", [])
-    out: List[Tuple[str, str]] = []
+    out: List[Dict[str, str]] = []
+
     if not isinstance(dates, list):
         return out
+
     for d in dates:
         if not isinstance(d, dict):
             continue
-        start = (d.get("start") or {}).get("date")
-        end = (d.get("end") or {}).get("date")
-        if start:
-            out.append((str(start), str(end or start)))
-    return out
+
+        s_obj = d.get("start") or {}
+        e_obj = d.get("end") or {}
+
+        s_date = str(s_obj.get("date") or "").strip()
+        e_date = str(e_obj.get("date") or s_date or "").strip()
+
+        if not s_date:
+            continue
+
+        # all-day / hide_time may appear as strings "0"/"1"
+        allday = str(d.get("allday") or "0").strip() in {"1", "true", "True", "yes", "Yes"}
+        hide_time = str(d.get("hide_time") or "0").strip() in {"1", "true", "True", "yes", "Yes"}
+
+        start_time = "" if (allday or hide_time) else _format_time_from_parts(
+            s_obj.get("hour"), s_obj.get("minutes"), s_obj.get("ampm")
+        )
+        stop_time = "" if (allday or hide_time) else _format_time_from_parts(
+            e_obj.get("hour"), e_obj.get("minutes"), e_obj.get("ampm")
+        )
+
+        # skip repeat artifacts that create huge ranges
+        sd = _parse_ymd(s_date)
+        ed = _parse_ymd(e_date)
+        if sd and ed:
+            span = (ed - sd).days
+            if span > max_span_days:
+                continue
+
+        out.append(
+            {
+                "start_date": s_date,
+                "end_date": e_date,
+                "start_time": start_time,
+                "stop_time": stop_time,
+            }
+        )
+
+    # de-dupe identical occurrences
+    seen = set()
+    uniq: List[Dict[str, str]] = []
+    for o in out:
+        key = (o["start_date"], o["end_date"], o["start_time"], o["stop_time"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(o)
+
+    return uniq
 
 
-def _build_rows_for_event(detail: Dict[str, Any], header: List[str]) -> List[Dict[str, str]]:
+def _extract_canceled(event_data: Dict[str, Any]) -> bool:
+    """
+    MEC stores status in meta.mec_event_status (e.g., EventScheduled / EventCancelled).
+    We'll treat anything containing 'cancel' as canceled.
+    """
+    meta = event_data.get("meta", {})
+    status = ""
+    if isinstance(meta, dict):
+        status = str(meta.get("mec_event_status") or meta.get("event_status") or "").strip()
+    if not status:
+        status = str(event_data.get("event_status") or "").strip()
+
+    return "cancel" in status.lower()
+
+
+def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_days: int) -> List[Dict[str, str]]:
     data = detail.get("data", {})
     post = data.get("post", {}) if isinstance(data, dict) else {}
     content_html = post.get("post_content") or post.get("post_content_filtered") or ""
@@ -249,34 +358,41 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str]) -> List[Dic
     parking_date = fields.get("parking_date", "").strip()
     parking_time = fields.get("parking_time", "").strip()
 
+    canceled = _extract_canceled(data)
+
     title = str(data.get("title") or post.get("post_title") or "").strip()
 
     url = str(data.get("permalink") or "").strip()
     if not url:
-        url = str(detail.get("data", {}).get("permalink") or "").strip()
-    if not url:
         url = str(post.get("guid") or "").strip()
 
-    occurrences = _extract_dates(data) or [("", "")]
+    occurrences = _extract_occurrences(data, max_span_days=max_span_days)
+    if not occurrences:
+        occurrences = [{"start_date": "", "end_date": "", "start_time": "", "stop_time": ""}]
 
     header_map = _header_index_map(header)
     rows: List[Dict[str, str]] = []
 
-    for start_date, end_date in occurrences:
+    for occ in occurrences:
         row = {h: "" for h in header}
 
-        _set_by_alias(row, header_map, ["title", "event", "clinic", "name"], title)
+        _set_by_alias(row, header_map, ["title"], title)
         _set_by_alias(row, header_map, ["facility"], loc["facility"])
         _set_by_alias(row, header_map, ["address"], loc["address"])
         _set_by_alias(row, header_map, ["city"], loc["city"])
         _set_by_alias(row, header_map, ["state"], loc["state"])
         _set_by_alias(row, header_map, ["lat", "latitude"], loc["lat"])
         _set_by_alias(row, header_map, ["lng", "longitude", "lon"], loc["lng"])
-        _set_by_alias(row, header_map, ["opening_hour", "opening hour"], loc["opening_hour"])
         _set_by_alias(row, header_map, ["url", "link", "permalink"], url)
 
-        _set_by_alias(row, header_map, ["start_date", "start date", "date start"], start_date)
-        _set_by_alias(row, header_map, ["end_date", "end date", "date end"], end_date)
+        # your CSV has "site" as "City, State"
+        site_value = ", ".join([p for p in [loc["city"], loc["state"]] if p])
+        _set_by_alias(row, header_map, ["site"], site_value)
+
+        _set_by_alias(row, header_map, ["start_date", "start date"], occ["start_date"])
+        _set_by_alias(row, header_map, ["end_date", "end date"], occ["end_date"])
+        _set_by_alias(row, header_map, ["start_time", "start time"], occ["start_time"])
+        _set_by_alias(row, header_map, ["stop_time", "stop time", "end_time", "end time"], occ["stop_time"])
 
         _set_by_alias(row, header_map, ["parking_date", "parking date"], parking_date)
         _set_by_alias(row, header_map, ["parking_time", "parking time"], parking_time)
@@ -286,22 +402,16 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str]) -> List[Dic
         _set_by_alias(row, header_map, ["vision"], _yn(svc["vision"]))
         _set_by_alias(row, header_map, ["dentures"], _yn(svc["dentures"]))
 
+        # your CSV has telehealth as Yes/No already
         _set_by_alias(row, header_map, ["telehealth"], _yn(ctype["telehealth"]))
-        _set_by_alias(row, header_map, ["popup", "pop-up", "pop up"], _yn(ctype["popup"]))
 
-        popup_col = _find_header_contains(header, "pop")
-        tele_col = _find_header_contains(header, "telehealth")
-        if popup_col and not row.get(popup_col):
-            row[popup_col] = _yn(ctype["popup"])
-        if tele_col and not row.get(tele_col):
-            row[tele_col] = _yn(ctype["telehealth"])
+        # canceled column exists in your CSV
+        _set_by_alias(row, header_map, ["canceled", "cancelled"], _yn(canceled))
 
-        pdate_col = _find_header_contains(header, "parking", "date")
-        ptime_col = _find_header_contains(header, "parking", "time")
-        if pdate_col and not row.get(pdate_col):
-            row[pdate_col] = parking_date
-        if ptime_col and not row.get(ptime_col):
-            row[ptime_col] = parking_time
+        # flexible matches in case of minor header variations
+        ccol = _find_header_contains(header, "cancel")
+        if ccol and not row.get(ccol):
+            row[ccol] = _yn(canceled)
 
         rows.append(row)
 
@@ -316,6 +426,7 @@ def main() -> None:
     start = os.environ.get("MEC_START", "2026-01-01").strip()
     end = os.environ.get("MEC_END", "2027-12-31").strip()
     limit = os.environ.get("MEC_LIMIT", "200").strip()
+    max_span_days = int(os.environ.get("MAX_SPAN_DAYS", "10").strip() or "10")
 
     debug = os.environ.get("MEC_DEBUG", "").strip() in {"1", "true", "yes", "y"}
 
@@ -325,11 +436,25 @@ def main() -> None:
     header = _read_existing_header(csv_path)
     if not header:
         header = [
-            "title", "facility", "address", "city", "state", "lat", "lng",
-            "medical", "dental", "vision", "dentures",
-            "telehealth", "popup",
-            "parking_date", "parking_time",
-            "start_date", "end_date",
+            "canceled",
+            "lat",
+            "lng",
+            "address",
+            "city",
+            "state",
+            "site",
+            "facility",
+            "telehealth",
+            "start_time",
+            "stop_time",
+            "start_date",
+            "end_date",
+            "parking_date",
+            "parking_time",
+            "medical",
+            "dental",
+            "vision",
+            "dentures",
             "url",
         ]
 
@@ -349,7 +474,7 @@ def main() -> None:
     all_rows: List[Dict[str, str]] = []
     for eid in event_ids:
         detail = _mec_get(base_url, token, f"events/{eid}")
-        all_rows.extend(_build_rows_for_event(detail, header))
+        all_rows.extend(_build_rows_for_event(detail, header, max_span_days=max_span_days))
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
