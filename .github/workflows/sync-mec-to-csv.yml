@@ -30,6 +30,10 @@ jobs:
           MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
           MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
           CSV_PATH: "Clinic Master Schedule TEST.csv"
+          MEC_START: "2026-01-01"
+          MEC_END: "2027-12-31"
+          MEC_LIMIT: "200"
+          MEC_DEBUG: "1"
         run: |
           python scripts/sync_mec_to_csv.py
 
