@@ -73,6 +73,11 @@ def _strip_html(html: str) -> str:
 def _read_existing_header(csv_path: str) -> Optional[List[str]]:
     if not os.path.exists(csv_path):
         return None
+        def _sort_key(row: Dict[str, str]):
+    # start_date can be YYYY-MM-DD or empty
+    s = (row.get("start_date") or "").strip()
+    # Put blanks at the end
+    return (s == "", s, (row.get("title") or "").lower())
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         r = csv.reader(f)
         try:
