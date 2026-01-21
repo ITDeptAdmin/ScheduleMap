@@ -3,7 +3,7 @@ name: Sync MEC events to MAIN schedule CSV
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *"  # every 30 minutes
 
 permissions:
   contents: write
@@ -29,10 +29,21 @@ jobs:
         env:
           MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
           MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
+
+          # IMPORTANT: this must match the file your website reads
           CSV_PATH: "Clinic Master Schedule for git.csv"
-          MEC_START: "2026-01-01"
+
+          # IMPORTANT: start earlier so recurring/series events that began in 2025
+          # still get included when they have 2026+ occurrences
+          MEC_START: "2025-01-01"
           MEC_END: "2027-12-31"
+
           MEC_LIMIT: "200"
+          MEC_WINDOW_DAYS: "31"
+          MEC_PAGE_MAX: "20"
+          MAX_SPAN_DAYS: "10"
+
+          # Set to "1" while validating, then change to "0" or remove
           MEC_DEBUG: "1"
         run: |
           python scripts/sync_mec_to_csv.py
