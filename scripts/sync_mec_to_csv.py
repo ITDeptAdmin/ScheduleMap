@@ -5,7 +5,8 @@ Sync Modern Events Calendar (MEC) events to a GitHub-tracked CSV.
 
 Fixes:
 - Retries on HTTP 202 (server "accepted" but not ready yet).
-- Services flags come ONLY from custom field "Services" or structured taxonomies (not HTML body).
+- Services flags come from custom field "Services" (checkbox-safe parsing). If missing,
+  falls back to structured taxonomies (categories/tags/labels/title) only.
 - Writes comma CSV by default (your schedule JS requires commas).
 
 Required env vars:
@@ -164,7 +165,7 @@ def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
         {
-            "User-Agent": "ram-mec-sync/1.2",
+            "User-Agent": "ram-mec-sync/1.3",
             "Accept": "application/json,text/plain,*/*",
         }
     )
@@ -206,14 +207,14 @@ def _mec_get(
             return resp
 
         if resp.status_code in {202, 429, 500, 502, 503, 504} and attempt < retries:
-            backoff = min(30, 2 ** attempt)
+            backoff = min(30, 2**attempt)
             _debug(cfg, f"[mec] retryable {resp.status_code}; body='{_resp_snippet(resp)}'; sleeping {backoff}s")
             time.sleep(backoff)
             continue
 
         return resp
 
-    return resp  # last response
+    return resp
 
 
 def _flatten_events_payload(payload: Any) -> List[Dict[str, Any]]:
@@ -287,6 +288,71 @@ def _extract_location(event_data: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _truthy(v: Any) -> bool:
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on", "checked"}
+
+
+def _coerce_field_value_to_text(field: Dict[str, Any]) -> str:
+    """
+    MEC checkbox fields can return value as:
+      - list of labels
+      - dict of label->0/1
+      - string of ids/indexes like "1,3"
+    Normalize to a string of labels.
+    """
+    value = field.get("value")
+
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(x).strip() for x in value if str(x).strip()]
+        return " ".join(parts).strip()
+
+    if isinstance(value, dict):
+        selected = [str(k).strip() for k, v in value.items() if _truthy(v) and str(k).strip()]
+        if selected:
+            return " ".join(selected).strip()
+        vals = [str(v).strip() for v in value.values() if str(v).strip()]
+        return " ".join(vals).strip()
+
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return ""
+
+    options = field.get("options") or field.get("option") or field.get("values") or field.get("items")
+    opts_list: List[str] = []
+    if isinstance(options, list):
+        for opt in options:
+            if isinstance(opt, dict):
+                label = (opt.get("label") or opt.get("title") or opt.get("name") or opt.get("value") or "").strip()
+                if label:
+                    opts_list.append(label)
+            else:
+                label = str(opt).strip()
+                if label:
+                    opts_list.append(label)
+
+    if opts_list and re.fullmatch(r"[\d,\s]+", s):
+        idxs: List[int] = []
+        for tok in re.split(r"[,\s]+", s):
+            if not tok:
+                continue
+            try:
+                idxs.append(int(tok))
+            except Exception:
+                pass
+
+        mapped: List[str] = []
+        for i in idxs:
+            if 1 <= i <= len(opts_list):
+                mapped.append(opts_list[i - 1])
+            elif 0 <= i < len(opts_list):
+                mapped.append(opts_list[i])
+
+        if mapped:
+            return " ".join(mapped).strip()
+
+    return s
+
+
 def _extract_custom_fields(event_data: Dict[str, Any]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     fields = event_data.get("fields", [])
@@ -297,16 +363,16 @@ def _extract_custom_fields(event_data: Dict[str, Any]) -> Dict[str, str]:
         if not isinstance(f, dict):
             continue
         label = _norm(str(f.get("label", "")))
-        value = "" if f.get("value") is None else str(f.get("value")).strip()
+        value_text = _coerce_field_value_to_text(f)
 
         if label == "services":
-            out["services"] = value
+            out["services"] = value_text
         elif label in {"clinic type", "clinictype"}:
-            out["clinic_type"] = value
+            out["clinic_type"] = value_text
         elif label in {"parking_date", "parking date"}:
-            out["parking_date"] = value
+            out["parking_date"] = value_text
         elif label in {"parking_time", "parking time"} or label.startswith("parking_time"):
-            out["parking_time"] = value
+            out["parking_time"] = value_text
 
     return out
 
@@ -343,15 +409,16 @@ def _extract_taxonomy_text(event_data: Dict[str, Any]) -> str:
 
 def _services_flags(services_value: str, safe_fallback_text: str) -> Dict[str, bool]:
     src = (services_value or "").strip() or (safe_fallback_text or "").strip()
+    s = src.lower()
 
-    def has(w: str) -> bool:
-        return w.lower() in src.lower()
+    def has_word(pattern: str) -> bool:
+        return re.search(pattern, s) is not None
 
     return {
-        "medical": has("medical"),
-        "dental": has("dental"),
-        "vision": has("vision"),
-        "dentures": has("denture"),
+        "medical": has_word(r"\bmedical\b"),
+        "dental": has_word(r"\bdental\b"),
+        "vision": has_word(r"\bvision\b"),
+        "dentures": has_word(r"\bdenture(s)?\b"),
     }
 
 
@@ -468,6 +535,9 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any]) -> List[Dict[str, st
 
     if not occurrences:
         occurrences = [{"start_date": "", "end_date": "", "start_time": "", "end_time": ""}]
+
+    if cfg.debug and fields.get("services"):
+        _debug(cfg, f"[svc] services_field='{fields.get('services')}' title='{title}'")
 
     rows: List[Dict[str, str]] = []
     for occ in occurrences:
@@ -626,6 +696,9 @@ def main() -> None:
     print(f"[cfg] base_url={cfg.base_url}")
     print(f"[cfg] start={cfg.start} end={cfg.end} limit={cfg.limit} max_pages={cfg.max_pages} max_span_days={cfg.max_span_days}")
     print(f"[cfg] csv_path={cfg.csv_path} delimiter={delimiter_label} date_format={cfg.date_format}")
+
+    if cfg.delimiter != ",":
+        print("[warn] Your schedule JS requires commas (`txt.includes(',')`). Prefer CSV_DELIMITER=comma.")
 
     sess = _session()
     event_ids = _iter_event_ids(cfg, sess)
