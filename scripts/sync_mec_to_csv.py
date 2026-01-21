@@ -4,12 +4,12 @@
 Sync Modern Events Calendar (MEC) events to a GitHub-tracked CSV.
 
 Required env vars:
-- MEC_BASE_URL: e.g. https://www.staging12.ramusa.org/wp-json/mec/v1.0
+- MEC_BASE_URL: e.g. https://www.ramusa.org/wp-json/mec/v1.0
 - MEC_TOKEN: MEC API key (sent as header: mec-token)
-- CSV_PATH: output CSV filename in repo, e.g. "Clinic Master Schedule TEST.csv"
+- CSV_PATH: output CSV filename in repo, e.g. "Clinic Master Schedule for git.csv"
 
 Optional env vars:
-- MEC_START: YYYY-MM-DD (default: 2026-01-01)
+- MEC_START: YYYY-MM-DD (default: 2025-01-01)
 - MEC_END:   YYYY-MM-DD (default: 2027-12-31)
 - MEC_LIMIT: int (default: 200)
 - MAX_SPAN_DAYS: int (default: 10)  # skips suspiciously long occurrences from repeat rules
@@ -22,7 +22,7 @@ import csv
 import os
 import re
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -227,13 +227,6 @@ def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
 
 
 def _detail_dates_blocks(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    MEC puts occurrence dates here most reliably:
-      detail["dates"] -> list
-    Sometimes also:
-      detail["date"]  -> single dict
-      detail["data"]["dates"] -> list (less common)
-    """
     blocks: List[Dict[str, Any]] = []
 
     d0 = detail.get("dates")
@@ -271,8 +264,12 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
         allday = str(b.get("allday") or "0").strip().lower() in {"1", "true", "yes"}
         hide_time = str(b.get("hide_time") or "0").strip().lower() in {"1", "true", "yes"}
 
-        start_time = "" if (allday or hide_time) else _format_time(s_obj.get("hour"), s_obj.get("minutes"), s_obj.get("ampm"))
-        stop_time = "" if (allday or hide_time) else _format_time(e_obj.get("hour"), e_obj.get("minutes"), e_obj.get("ampm"))
+        start_time = "" if (allday or hide_time) else _format_time(
+            s_obj.get("hour"), s_obj.get("minutes"), s_obj.get("ampm")
+        )
+        end_time = "" if (allday or hide_time) else _format_time(
+            e_obj.get("hour"), e_obj.get("minutes"), e_obj.get("ampm")
+        )
 
         sd = _parse_ymd(s_date)
         ed = _parse_ymd(e_date)
@@ -284,15 +281,14 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
                 "start_date": s_date,
                 "end_date": e_date,
                 "start_time": start_time,
-                "stop_time": stop_time,
+                "end_time": end_time,
             }
         )
 
-    # de-dupe
     seen = set()
     uniq: List[Dict[str, str]] = []
     for o in out:
-        k = (o["start_date"], o["end_date"], o["start_time"], o["stop_time"])
+        k = (o["start_date"], o["end_date"], o["start_time"], o["end_time"])
         if k in seen:
             continue
         seen.add(k)
@@ -301,19 +297,21 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
     return uniq
 
 
-def _extract_canceled(event_data: Dict[str, Any]) -> bool:
+def _extract_status_and_canceled(event_data: Dict[str, Any]) -> Tuple[str, bool]:
     meta = event_data.get("meta", {})
     status = ""
     if isinstance(meta, dict):
         status = str(meta.get("mec_event_status") or meta.get("event_status") or "").strip()
     if not status:
         status = str(event_data.get("event_status") or "").strip()
-    return "cancel" in status.lower()
+    canceled = "cancel" in status.lower()
+    return status, canceled
 
 
 def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_days: int, debug: bool) -> List[Dict[str, str]]:
     data = detail.get("data", {})
     post = data.get("post", {}) if isinstance(data, dict) else {}
+
     content_html = post.get("post_content") or post.get("post_content_filtered") or ""
     content_text = _strip_html(str(content_html))
 
@@ -321,7 +319,8 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
     fields = _extract_custom_fields(data)
     svc = _services_flags(fields.get("services", ""), content_text)
     ctype = _clinic_type_flags(fields.get("clinic_type", ""), content_text)
-    canceled = _extract_canceled(data)
+
+    status, canceled = _extract_status_and_canceled(data)
 
     parking_date = fields.get("parking_date", "").strip()
     parking_time = fields.get("parking_time", "").strip()
@@ -335,7 +334,7 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
         print(f"[warn] No occurrences parsed for event {eid} title={title!r}. Keys(detail)={list(detail.keys())}")
 
     if not occurrences:
-        occurrences = [{"start_date": "", "end_date": "", "start_time": "", "stop_time": ""}]
+        occurrences = [{"start_date": "", "end_date": "", "start_time": "", "end_time": ""}]
 
     hmap = _header_map(header)
     rows: List[Dict[str, str]] = []
@@ -343,13 +342,16 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
     for occ in occurrences:
         row = {h: "" for h in header}
 
+        _set_by_alias(row, hmap, ["status"], status)
         _set_by_alias(row, hmap, ["canceled", "cancelled"], _yn(canceled))
+
         _set_by_alias(row, hmap, ["lat"], loc["lat"])
         _set_by_alias(row, hmap, ["lng", "lon", "longitude"], loc["lng"])
         _set_by_alias(row, hmap, ["address"], loc["address"])
         _set_by_alias(row, hmap, ["city"], loc["city"])
         _set_by_alias(row, hmap, ["state"], loc["state"])
         _set_by_alias(row, hmap, ["facility"], loc["facility"])
+
         _set_by_alias(row, hmap, ["title"], title)
         _set_by_alias(row, hmap, ["url"], url)
 
@@ -361,7 +363,7 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
         _set_by_alias(row, hmap, ["start_date", "start date"], occ["start_date"])
         _set_by_alias(row, hmap, ["end_date", "end date"], occ["end_date"])
         _set_by_alias(row, hmap, ["start_time", "start time"], occ["start_time"])
-        _set_by_alias(row, hmap, ["stop_time", "stop time", "end_time", "end time"], occ["stop_time"])
+        _set_by_alias(row, hmap, ["end_time", "end time", "stop_time", "stop time"], occ["end_time"])
 
         _set_by_alias(row, hmap, ["parking_date", "parking date"], parking_date)
         _set_by_alias(row, hmap, ["parking_time", "parking time"], parking_time)
@@ -371,12 +373,12 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
         _set_by_alias(row, hmap, ["vision"], _yn(svc["vision"]))
         _set_by_alias(row, hmap, ["dentures"], _yn(svc["dentures"]))
 
-        # extra safety for slight header variants
+        # Extra safety for slight header variants
         for col, val in [
             (_find_header_contains(header, "start", "date"), occ["start_date"]),
             (_find_header_contains(header, "end", "date"), occ["end_date"]),
             (_find_header_contains(header, "start", "time"), occ["start_time"]),
-            (_find_header_contains(header, "stop", "time"), occ["stop_time"]),
+            (_find_header_contains(header, "end", "time"), occ["end_time"]),
         ]:
             if col and not row.get(col):
                 row[col] = val
@@ -391,7 +393,7 @@ def main() -> None:
     token = os.environ.get("MEC_TOKEN", "").strip()
     csv_path = os.environ.get("CSV_PATH", "").strip()
 
-    start = os.environ.get("MEC_START", "2026-01-01").strip()
+    start = os.environ.get("MEC_START", "2025-01-01").strip()
     end = os.environ.get("MEC_END", "2027-12-31").strip()
     limit = os.environ.get("MEC_LIMIT", "200").strip()
     max_span_days = int(os.environ.get("MAX_SPAN_DAYS", "10").strip() or "10")
@@ -402,20 +404,23 @@ def main() -> None:
 
     header = _read_existing_header(csv_path)
     if not header:
+        # Recommended “main” header set that matches your front-end expectations
         header = [
             "canceled",
+            "status",
             "lat",
             "lng",
+            "title",
             "address",
             "city",
             "state",
             "site",
             "facility",
             "telehealth",
-            "start_time",
-            "stop_time",
             "start_date",
             "end_date",
+            "start_time",
+            "end_time",
             "parking_date",
             "parking_time",
             "medical",
@@ -428,6 +433,8 @@ def main() -> None:
     params = {"start": start, "end": end, "limit": limit}
     if debug:
         print(f"List params: {params}")
+        print(f"MEC_BASE_URL: {base_url}")
+        print(f"CSV_PATH: {csv_path}")
 
     list_payload = _mec_get(base_url, token, "events", params=params)
     event_ids = _extract_event_ids(list_payload)
