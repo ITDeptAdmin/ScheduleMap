@@ -25,12 +25,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Build CSV from MEC (MAIN)
+      - name: Build CSV from MEC
         env:
           MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
           MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
           CSV_PATH: "Clinic Master Schedule for git.csv"
-          # Pull back far enough to include repeating series whose FIRST instance is old
           MEC_START: "2010-01-01"
           MEC_END: "2030-12-31"
           MEC_LIMIT: "200"
