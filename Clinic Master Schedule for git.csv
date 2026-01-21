@@ -1,68 +1,68 @@
-canceled,lat,lng,address,city,state,title,facility,telehealth,start_time,stop_time,start_date,end_date,parking_date,parking_time,medical,dental,vision,dentures,url
-2026-06-06
-2026-04-11
-2026-01-25
-2026-02-01
-2026-02-13
-2026-02-20
-2026-02-22
-2026-03-01
-2026-06-13
-2026-10-24
-2026-03-28
-2026-04-11
-2026-02-28
-2026-02-10
-2026-03-10
-2026-03-21
-2026-02-14
-2026-04-11
-2026-08-08
-2026-02-05
-2026-03-05
-2026-10-17
-2026-09-12
-2026-03-07
-2026-07-11
-2026-07-25
-2026-08-08
-2026-08-29
-2026-04-25
-2026-10-17
-2026-10-31
-2026-03-21
-2026-08-01
-2026-03-28
-2026-04-25
-2026-01-27
-2026-02-24
-2026-03-24
-2026-05-30
-2026-03-21
-2026-02-06
-2026-01-28
-2026-02-18
-2026-02-25
-2026-03-18
-2026-03-25
-2026-02-19
-2026-03-19
-2026-08-01
-2026-04-11
-2026-03-03
-2026-02-03
-2026-02-19
-2026-03-19
-2026-03-20
-2026-08-01
-2026-02-18
-2026-03-18
-2026-01-22
-2026-02-26
-2026-03-26
-2026-09-26
-2026-02-04
-2026-03-04
-2026-05-30
-2027-11-13
-2026-10-03
+canceled	lat	lng	address	city	state	title	facility	telehealth	start_time	stop_time	start_date	end_date	parking_date	parking_time	medical	dental	vision	dentures	url
+No	36.1410499	-80.5562863	1431 Falcon Rd, East Bend, NC 27018	East Bend	NC	East Bend, North Carolina	Forbush Middle School	No			6/6/2026	6/7/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/east-bend-nc-2026/
+No	35.8806173	-84.619945	276 Patton Lane, Harriman, TN 37748	Harriman	TN	Harriman, Tennessee	Roane State Community College (Main Campus)	No			4/11/2026	4/12/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/harriman-tn-2025/
+No	35.9721713	-83.922493	519 Williams Street, Knoxville, Tennessee 37917	Knoxville	TN	Care Cuts (Telehealth)	Care Cuts	Yes	10:00 AM	2:00 PM	1/25/2026	1/25/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-mobile-th-carecuts/
+No	35.9721713	-83.922493	519 Williams Street, Knoxville, Tennessee 37917	Knoxville	TN	Care Cuts (Telehealth)	Care Cuts	Yes	10:00 AM	2:00 PM	2/1/2026	2/1/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-mobile-th-carecuts/
+No	35.9721713	-83.922493	519 Williams Street, Knoxville, Tennessee 37917	Knoxville	TN	Care Cuts (Telehealth)	Care Cuts	Yes	10:00 AM	2:00 PM	2/13/2026	2/13/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-mobile-th-carecuts/
+No	35.9721713	-83.922493	519 Williams Street, Knoxville, Tennessee 37917	Knoxville	TN	Care Cuts (Telehealth)	Care Cuts	Yes	10:00 AM	2:00 PM	2/20/2026	2/20/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-mobile-th-carecuts/
+No	35.9721713	-83.922493	519 Williams Street, Knoxville, Tennessee 37917	Knoxville	TN	Care Cuts (Telehealth)	Care Cuts	Yes	10:00 AM	2:00 PM	2/22/2026	2/22/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-mobile-th-carecuts/
+No	35.9721713	-83.922493	519 Williams Street, Knoxville, Tennessee 37917	Knoxville	TN	Care Cuts (Telehealth)	Care Cuts	Yes	10:00 AM	2:00 PM	3/1/2026	3/1/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-mobile-th-carecuts/
+No	39.644827100593545	-87.70160181341522	14040 E 1200th Rd Paris, Illinois 61944	Paris	IL	Paris, Illinois	Paris High School	No			6/13/2026	6/14/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/paris-il-2026/
+No	35.4191616	-94.37694700000002	4400 Midland Blvd, Fort Smith, AR 72904	Fort Smith	AR	Fort Smith, Arkansas	Kay Rodgers Park	No			10/24/2026	10/25/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/fort-smith-ar/
+No	36.342529	-78.4319329	2090 Ross Mill Road, Henderson, NC 27537	Henderson	NC	Henderson, North Carolina	Vance Charter School	No			3/28/2026	3/29/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/henderson-nc/
+No	41.84222417678834	-80.82228543010675	6620 Sanborn Road, Ashtabula, OH	Ashtabula	OH	Ashtabula, Ohio	Lakeside Junior High School	No			4/11/2026	4/12/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/ashtabula-oh/
+No	41.5018502	-81.6121253	2075 Stokes Blvd, Cleveland, OH 44106	Cleveland	OH	Cleveland, Ohio	John Hay High School	No			2/28/2026	3/1/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/cleveland-oh/
+No	35.9549851	-83.9068191	712 Boggs Ave, Knoxville, Tennessee 37920	Knoxville	TN	Steps House (Telehealth)	Steps House	Yes	10:00 AM	2:00 PM	2/10/2026	2/10/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-on-site-telehealth-steps-house/
+No	35.9549851	-83.9068191	712 Boggs Ave, Knoxville, Tennessee 37920	Knoxville	TN	Steps House (Telehealth)	Steps House	Yes	10:00 AM	2:00 PM	3/10/2026	3/10/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-on-site-telehealth-steps-house/
+No	38.0853839	-78.9998925	277 Expo Road, Fishersville, Virginia 22939	Fishersville	VA	Fishersville, Virginia	Augusta Expo	No			3/21/2026	3/22/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/fishersville-va-2025/
+No	34.8213722	-82.4113638	607 Grove Road Greenville, SC 29605	Greenville	SC	Greenville, South Carolina	University of South Carolina School of Medicine	No			2/14/2026	2/15/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/2026-greenville-sc/
+No	35.7505332	-83.9790146	703 W Broadway Ave Maryville, TN 37801	Maryville	TN	SOS Day	New Providence Presbyterian Church	Yes	12:00 PM	3:00 PM	4/11/2026	4/11/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/sos-day/
+No	35.7505332	-83.9790146	703 W Broadway Ave Maryville, TN 37801	Maryville	TN	SOS Day	New Providence Presbyterian Church	Yes	12:00 PM	3:00 PM	8/8/2026	8/8/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/sos-day/
+No	35.9059151	-84.1128544	9919 Kingston Pike	Knoxville	TN	KNOXVILLE, TN ON-SITE TELEHEALTH (Fig Tree)	Fig Tree	Yes	11:00 AM	2:00 PM	2/5/2026	2/5/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-on-site-telehealth-fig-tree/
+No	35.9059151	-84.1128544	9919 Kingston Pike	Knoxville	TN	KNOXVILLE, TN ON-SITE TELEHEALTH (Fig Tree)	Fig Tree	Yes	11:00 AM	2:00 PM	3/5/2026	3/5/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-on-site-telehealth-fig-tree/
+No	37.3087043	-82.1457954	27382 Riverside Drive, Grundy, Virginia 24614	Grundy	VA	Grundy, Virginia	Riverview Elementary/Middle School	No			10/17/2026	10/18/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/grundy-va-2026/
+No	42.1370564	-80.06337	650 East Ave suite 120, Erie, Pennsylvania 16503	Erie	PA	Erie, Pennsylvania	Erie Center for Arts and Technology	No			9/12/2026	9/13/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/erie-pa-2026/
+No	41.712464942580404	-72.21044220620686	1 Jillson sq Willimantic, Connecticut 06226	Willimantic	CT	Willimantic, Connecticut	Windham Senior Center	No			3/7/2026	3/8/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/willimantic-connecticut/
+No	39.2086927	-84.5042756	600 W North Bend Rd, Cincinnati, OH 45224	Cincinnati	OH	Cincinnati, Ohio	St. Xavier High School	No			7/11/2026	7/12/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/cincinnati-ohio/
+No	39.42515681109518	-87.40851602749825	3737 S 7th St Terre Haute, Indiana 47802	Terre Haute	IN	Terre Haute, Indiana	Terre Haute South High School	No			7/25/2026	7/26/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/terre-haute-indiana/
+No	42.9054808	-73.1877635	747 East Road, Bennington, VT 05201	Bennington	VT	Bennington, Vermont	Mt Anthony Union Middle School	No			8/8/2026	8/9/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/bennington-vt-2026/
+No	37.3629254	-82.3072649	19471 Lick Mountain Rd, Lick Creek, KY 41540	Lick Creek	KY	Lick Creek, Kentucky	East Ridge High School	No			8/29/2026	8/30/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/lick-creek-ky-2026/
+No	25.954138999904323	-80.25233730846755	3000 NW 199th St Miami Gardens, Florida 33056	Miami Gardens	FL	Miami Gardens, Florida	Betty T. Ferguson Recreational Complex 3000 NW 199th St Miami Gardens, Florida 33056	No			4/25/2026	4/26/2026			No	Yes	Yes	No	https://www.ramusa.org/events/miami-gardens-florida/
+No	35.9398447	-85.4781622	267 Allen Drive, Sparta, TN 38583	Sparta	TN	Sparta, Tennessee	White County High School	No			10/17/2026	10/18/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/sparta-tn-2026/
+No	40.63060667469223	-75.36191201672234	1170 Fernwood St Bethlehem, Pennsylvania 18018	Bethlehem	PA	Bethlehem, Pennsylvania	Northeast Middle School	No			10/31/2026	11/1/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/bethlehem-pennsylvania/
+No	30.407572047254195	-84.26215471600028	3013 Jim Lee Rd Tallahassee, Florida 32301	Tallahassee	FL	Tallahassee, Florida	Rickards High School	No			3/21/2026	3/22/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/tallahassee-florida/
+No	42.98299183890017	-89.55324368964098	234 Wildcat Way Verona, Wisconsin 53593	Verona	WI	Verona, Wisconsin	Verona Area High School	No			8/1/2026	8/2/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/verona-wisconsin/
+No	40.9403586	-77.8005317	751 S Eagle Valley Road, Bellefonte, Pennsylvania 16823	Bellefonte	PA	Bellefonte, Pennsylvania	Bald Eagle Area Middle and High	No			3/28/2026	3/29/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/bellefonte-pennsylvania-2026/
+No	32.3789195	-86.2943357	110 Hall St, Montgomery, AL 36104	Montgomery	AL	Montgomery, Alabama	Multiplex at Cramton Bowl	No			4/25/2026	4/26/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/montgomery-alabama/
+No	35.42988701412957	-84.57624232033876	407 New Englewood Road Athens, Tennessee 37303	Athens	TN	Better Living (Telehealth)	Better Living Center- Seventh Day Adventist Church, Athens	Yes	10:00 AM	2:00 PM	1/27/2026	1/27/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/better-living-telehealth/
+No	35.42988701412957	-84.57624232033876	407 New Englewood Road Athens, Tennessee 37303	Athens	TN	Better Living (Telehealth)	Better Living Center- Seventh Day Adventist Church, Athens	Yes	10:00 AM	2:00 PM	2/24/2026	2/24/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/better-living-telehealth/
+No	35.42988701412957	-84.57624232033876	407 New Englewood Road Athens, Tennessee 37303	Athens	TN	Better Living (Telehealth)	Better Living Center- Seventh Day Adventist Church, Athens	Yes	10:00 AM	2:00 PM	3/24/2026	3/24/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/better-living-telehealth/
+No	43.6795912	-85.4852821	210 Sports Dr, Big Rapids, MI	Big Rapids	MI	Big Rapids, Michigan	R.L. Ewigleben Sports Complex	No			5/30/2026	5/31/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/big-rapids-mi-2026/
+No	36.1927679	-85.4919761	2335 N Washington Ave, Cookeville, TN 38501	Cookeville	TN	Cookeville, Tennessee	Cookeville High School	No			3/21/2026	3/22/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/cookeville-tn-2026/
+No	36.000219161062525	-83.88528787755844	3301 E Magnolia Ave, Knoxville, TN 37914	Knoxville	TN	Knoxville, Tennessee	Jacob Building	No			2/6/2026	2/8/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/knoxville-tn-2026/
+No	35.4415435	-84.59175549999999	106 S Jackson St, Athens, TN 37303	Athens	TN	Table Graces Athens (Telehealth)	Athens Market Pavilion	Yes	9:00 AM	1:00 PM	1/28/2026	1/28/2026			Yes	No	No	No	https://www.ramusa.org/events/table-graces-athens-telehealth/
+No	35.4415435	-84.59175549999999	106 S Jackson St, Athens, TN 37303	Athens	TN	Table Graces Athens (Telehealth)	Athens Market Pavilion	Yes	9:00 AM	1:00 PM	2/18/2026	2/18/2026			Yes	No	No	No	https://www.ramusa.org/events/table-graces-athens-telehealth/
+No	35.4415435	-84.59175549999999	106 S Jackson St, Athens, TN 37303	Athens	TN	Table Graces Athens (Telehealth)	Athens Market Pavilion	Yes	9:00 AM	1:00 PM	2/25/2026	2/25/2026			Yes	No	No	No	https://www.ramusa.org/events/table-graces-athens-telehealth/
+No	35.4415435	-84.59175549999999	106 S Jackson St, Athens, TN 37303	Athens	TN	Table Graces Athens (Telehealth)	Athens Market Pavilion	Yes	9:00 AM	1:00 PM	3/18/2026	3/18/2026			Yes	No	No	No	https://www.ramusa.org/events/table-graces-athens-telehealth/
+No	35.4415435	-84.59175549999999	106 S Jackson St, Athens, TN 37303	Athens	TN	Table Graces Athens (Telehealth)	Athens Market Pavilion	Yes	9:00 AM	1:00 PM	3/25/2026	3/25/2026			Yes	No	No	No	https://www.ramusa.org/events/table-graces-athens-telehealth/
+No	35.95919008709133	-83.92054346305221	900 Henley Street, Knoxville, Tennessee 37902	Knoxville	TN	Church Street United Methodist Church (Telehealth)	Church Street United Methodist Church	Yes	10:00 AM	1:00 PM	2/19/2026	2/19/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/church-street-united-methodist-church/
+No	35.95919008709133	-83.92054346305221	900 Henley Street, Knoxville, Tennessee 37902	Knoxville	TN	Church Street United Methodist Church (Telehealth)	Church Street United Methodist Church	Yes	10:00 AM	1:00 PM	3/19/2026	3/19/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/church-street-united-methodist-church/
+No	39.3288887804681	-82.10907164069626	191 W Union St Athens, Ohio 45701	Athens	OH	Athens, Ohio	Ohio University Heritage College of Osteopathic Medicine: Heritage Hall	No			8/1/2026	8/2/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/athens-ohio/
+No	43.10666385618062	-73.58241691952433	14 Spring St. Schuylerville, New York 12871	Schuylerville	NY	Schuylerville, New York	Schuylerville Central School	No			4/11/2026	4/12/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/schuylerville-new-york/
+No	36.1015399	-84.1321644	225 North Main Street, Clinton, TN 37716	Clinton	TN	First Baptist Church in Clinton (Telehealth)	First Baptist Church in Clinton	Yes	1:00 PM	5:00 PM	3/3/2026	3/3/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/first-baptist-church-in-clinton-telehealth/
+No	36.1015399	-84.1321644	225 North Main Street, Clinton, TN 37716	Clinton	TN	First Baptist Church in Clinton (Telehealth)	First Baptist Church in Clinton	Yes	1:00 PM	5:00 PM	2/3/2026	2/3/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/first-baptist-church-in-clinton-telehealth/
+No	35.903406308012514	-83.01715944517768	480 S Hwy 107 Del Rio, Tennessee 37727	Del Rio	TN	Del Rio (Telehealth)	Del Rio	Yes	1:00 PM	4:00 PM	2/19/2026	2/19/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/del-rio-telehealth/
+No	35.903406308012514	-83.01715944517768	480 S Hwy 107 Del Rio, Tennessee 37727	Del Rio	TN	Del Rio (Telehealth)	Del Rio	Yes	1:00 PM	4:00 PM	3/19/2026	3/19/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/del-rio-telehealth/
+No	35.75274769613089	-83.96981431507258	202 W Lamar Alexander Pkwy Maryville, Tennessee 37801	Maryville	TN	First Baptist Church Maryville (Telehealth)	First Baptist Church Maryville	Yes	1:00 PM	5:00 PM	3/20/2026	3/20/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/first-baptist-church-maryville-telehealth/
+No	38.991946984071	-104.7924342830008	11125 Cross Peak View Colorado Springs, CO 80921	Colorado Springs	CO	Colorado Springs, Colorado	Pikes Peak State College	No			8/1/2026	8/2/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/colorado-springs-colorado/
+No	35.93309810716069	-83.91523771814519	201 Ogle Ave. Knoxville, TN 37920	Knoxville	TN	Sustainable Future Center (Telehealth)	Sustainable Future Center	Yes	9:00 AM	1:00 PM	2/18/2026	2/18/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/sustainable-future-center-telehealth/
+No	35.93309810716069	-83.91523771814519	201 Ogle Ave. Knoxville, TN 37920	Knoxville	TN	Sustainable Future Center (Telehealth)	Sustainable Future Center	Yes	9:00 AM	1:00 PM	3/18/2026	3/18/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/sustainable-future-center-telehealth/
+No	35.880794280421405	-83.580081394274	890 Old Knoxville Hwy Sevierville, TN 37862	Sevier	TN	Sevier Co. Food Ministries (Telehealth)	Sevier Co. Food Ministries	Yes	11:00 AM	3:00 PM	1/22/2026	1/22/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/sevier-co-food-ministries-telehealth/
+No	35.880794280421405	-83.580081394274	890 Old Knoxville Hwy Sevierville, TN 37862	Sevier	TN	Sevier Co. Food Ministries (Telehealth)	Sevier Co. Food Ministries	Yes	11:00 AM	3:00 PM	2/26/2026	2/26/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/sevier-co-food-ministries-telehealth/
+No	35.880794280421405	-83.580081394274	890 Old Knoxville Hwy Sevierville, TN 37862	Sevier	TN	Sevier Co. Food Ministries (Telehealth)	Sevier Co. Food Ministries	Yes	11:00 AM	3:00 PM	3/26/2026	3/26/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/sevier-co-food-ministries-telehealth/
+No	38.65491	-78.4853203	243 Bulldog Drive, Luray, Virginia 22835	Luray	VA	Luray, Virginia	Luray High School	No			9/26/2026	9/27/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/luray-virginia/
+No	35.71151937322651	-84.01084270561084	2508 Old Niles Ferry Rd. Maryville Tennessee 37803	Maryville	TN	Fairview Church (Telehealth)	Fairview UMC	Yes	9:00 AM	12:00 PM	2/4/2026	2/4/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/fairview-church-telehealth/
+No	35.71151937322651	-84.01084270561084	2508 Old Niles Ferry Rd. Maryville Tennessee 37803	Maryville	TN	Fairview Church (Telehealth)	Fairview UMC	Yes	9:00 AM	12:00 PM	3/4/2026	3/4/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/fairview-church-telehealth/
+No	30.7895	-86.5602	1250 N Ferdon Blvd Crestview, Florida	Crestview	FL	Crestview, Florida	Crestview High School	No			5/30/2026	5/31/2026			Yes	Yes	Yes	No	https://www.ramusa.org/events/crestview-florida/
+No	36.198317	-86.2726754	945 E Baddour Pkwy, Lebanon, TN	Lebanon	TN	Lebanon, Tennessee	Farm Bureau Exposition Center	No			11/13/2027	11/14/2027			Yes	Yes	Yes	No	https://www.ramusa.org/events/lebanon-tennessee/
+No	42.71307119999999	-77.8743642	30 Bonadonna Avenue, Mount Morris, NY	Mount Morris	NY	Mount Morris, New York	Mount Morris Middle/Senior High School	No			10/3/2026	10/4/2026	2026-10-02	no later than 11:59 p.m. (midnight local time)	Yes	Yes	Yes	No	https://www.ramusa.org/events/mount-morris-new-york/
