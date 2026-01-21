@@ -3,14 +3,10 @@
 """
 Sync Modern Events Calendar (MEC) events to a GitHub-tracked CSV.
 
-Key behavior:
+Fixes:
+- Retries on HTTP 202 (server "accepted" but not ready yet).
+- Services flags come ONLY from custom field "Services" or structured taxonomies (not HTML body).
 - Writes comma CSV by default (your schedule JS requires commas).
-- Expands occurrences into rows.
-- Skips 404s gracefully.
-- Services (medical/dental/vision/dentures) are derived ONLY from:
-  1) MEC custom field "Services" (preferred)
-  2) structured taxonomies (categories/tags/labels) as fallback
-  NOT from full HTML body text (avoids false positives from boilerplate).
 
 Required env vars:
 - MEC_BASE_URL
@@ -54,7 +50,6 @@ _STATE_ABBR = {
     "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
     "puerto rico": "PR",
 }
-
 
 DEFAULT_HEADER: List[str] = [
     "canceled",
@@ -167,8 +162,22 @@ def _debug(cfg: Cfg, msg: str) -> None:
 
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "ram-mec-sync/1.1"})
+    s.headers.update(
+        {
+            "User-Agent": "ram-mec-sync/1.2",
+            "Accept": "application/json,text/plain,*/*",
+        }
+    )
     return s
+
+
+def _resp_snippet(resp: requests.Response, limit: int = 300) -> str:
+    try:
+        txt = resp.text or ""
+    except Exception:
+        return ""
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt[:limit]
 
 
 def _mec_get(
@@ -178,34 +187,33 @@ def _mec_get(
     params: Optional[Dict[str, str]] = None,
     *,
     allow_404: bool = False,
-    retries: int = 4,
+    retries: int = 6,
 ) -> requests.Response:
+    """
+    Retries on:
+      - 202 (accepted/processing)
+      - 429 rate-limit
+      - 5xx transient errors
+    """
     url = cfg.base_url.rstrip("/") + "/" + path.lstrip("/")
     headers = {"mec-token": cfg.token}
 
     for attempt in range(retries + 1):
-        try:
-            resp = sess.get(url, headers=headers, params=params, timeout=60)
-            _debug(cfg, f"[mec] GET {resp.url} -> {resp.status_code}")
+        resp = sess.get(url, headers=headers, params=params, timeout=60)
+        _debug(cfg, f"[mec] GET {resp.url} -> {resp.status_code}")
 
-            if allow_404 and resp.status_code == 404:
-                return resp
-
-            if resp.status_code in {429, 500, 502, 503, 504} and attempt < retries:
-                backoff = 2 ** attempt
-                _debug(cfg, f"[mec] retryable {resp.status_code}; sleeping {backoff}s")
-                time.sleep(backoff)
-                continue
-
+        if allow_404 and resp.status_code == 404:
             return resp
-        except Exception as e:
-            if attempt < retries:
-                backoff = 2 ** attempt
-                _debug(cfg, f"[mec] exception {type(e).__name__}: {e}; sleeping {backoff}s")
-                time.sleep(backoff)
-                continue
-            raise
-    raise RuntimeError("unreachable")
+
+        if resp.status_code in {202, 429, 500, 502, 503, 504} and attempt < retries:
+            backoff = min(30, 2 ** attempt)
+            _debug(cfg, f"[mec] retryable {resp.status_code}; body='{_resp_snippet(resp)}'; sleeping {backoff}s")
+            time.sleep(backoff)
+            continue
+
+        return resp
+
+    return resp  # last response
 
 
 def _flatten_events_payload(payload: Any) -> List[Dict[str, Any]]:
@@ -304,10 +312,6 @@ def _extract_custom_fields(event_data: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _extract_taxonomy_text(event_data: Dict[str, Any]) -> str:
-    """
-    Safely extracts names from structured taxonomies (categories/tags/labels).
-    Avoids scanning full HTML/event description which often contains boilerplate.
-    """
     chunks: List[str] = []
 
     def take_names(obj: Any) -> None:
@@ -328,7 +332,6 @@ def _extract_taxonomy_text(event_data: Dict[str, Any]) -> str:
         if key in event_data:
             take_names(event_data.get(key))
 
-    # Also include the title (often contains "Dental", "Vision", etc.)
     title = str(event_data.get("title") or "").strip()
     if title:
         chunks.append(title)
@@ -339,14 +342,7 @@ def _extract_taxonomy_text(event_data: Dict[str, Any]) -> str:
 
 
 def _services_flags(services_value: str, safe_fallback_text: str) -> Dict[str, bool]:
-    """
-    IMPORTANT:
-    - We do NOT use HTML body text because it can contain generic lists of services.
-    - We only use custom field 'Services' or structured taxonomies (categories/tags/labels) as fallback.
-    """
-    src = (services_value or "").strip()
-    if not src:
-        src = (safe_fallback_text or "").strip()
+    src = (services_value or "").strip() or (safe_fallback_text or "").strip()
 
     def has(w: str) -> bool:
         return w.lower() in src.lower()
@@ -476,7 +472,6 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any]) -> List[Dict[str, st
     rows: List[Dict[str, str]] = []
     for occ in occurrences:
         row: Dict[str, str] = {h: "" for h in DEFAULT_HEADER}
-
         row["canceled"] = _yn(canceled)
         row["lat"] = loc["lat"]
         row["lng"] = loc["lng"]
@@ -497,7 +492,6 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any]) -> List[Dict[str, st
         row["vision"] = _yn(svc["vision"])
         row["dentures"] = _yn(svc["dentures"])
         row["url"] = url
-
         rows.append(row)
 
     return rows
@@ -512,7 +506,7 @@ def _iter_event_ids(cfg: Cfg, sess: requests.Session) -> List[int]:
             params[page_param_name] = str(page)
         resp = _mec_get(cfg, sess, "events", params=params)
         if resp.status_code != 200:
-            raise SystemExit(f"MEC /events failed: HTTP {resp.status_code} url={resp.url}")
+            raise SystemExit(f"MEC /events failed: HTTP {resp.status_code} url={resp.url} body='{_resp_snippet(resp)}'")
         return _extract_event_ids(resp.json())
 
     ids_page1 = fetch_page("page", 1)
@@ -537,7 +531,7 @@ def _iter_event_ids(cfg: Cfg, sess: requests.Session) -> List[int]:
 
         resp = _mec_get(cfg, sess, "events", params=params)
         if resp.status_code != 200:
-            raise SystemExit(f"MEC /events failed: HTTP {resp.status_code} url={resp.url}")
+            raise SystemExit(f"MEC /events failed: HTTP {resp.status_code} url={resp.url} body='{_resp_snippet(resp)}'")
 
         ids = _extract_event_ids(resp.json())
         before = len(all_ids)
@@ -567,11 +561,11 @@ def _fetch_event_detail(cfg: Cfg, sess: requests.Session, eid: int) -> Optional[
             _debug(cfg, f"[warn] /events/{eid} -> 404 (skipping)")
             return None
         if resp2.status_code != 200:
-            raise SystemExit(f"MEC /events/{eid} failed: HTTP {resp2.status_code} url={resp2.url}")
+            raise SystemExit(f"MEC /events/{eid} failed: HTTP {resp2.status_code} url={resp2.url} body='{_resp_snippet(resp2)}'")
         return resp2.json()
 
     if resp.status_code != 200:
-        raise SystemExit(f"MEC /events/{eid} failed: HTTP {resp.status_code} url={resp.url}")
+        raise SystemExit(f"MEC /events/{eid} failed: HTTP {resp.status_code} url={resp.url} body='{_resp_snippet(resp)}'")
     return resp.json()
 
 
@@ -627,16 +621,13 @@ def _load_cfg() -> Cfg:
 
 def main() -> None:
     cfg = _load_cfg()
-
     delimiter_label = "TAB" if cfg.delimiter == "\t" else "COMMA"
+
     print(f"[cfg] base_url={cfg.base_url}")
     print(f"[cfg] start={cfg.start} end={cfg.end} limit={cfg.limit} max_pages={cfg.max_pages} max_span_days={cfg.max_span_days}")
     print(f"[cfg] csv_path={cfg.csv_path} delimiter={delimiter_label} date_format={cfg.date_format}")
-    if cfg.delimiter != ",":
-        print("[warn] Your schedule JS requires commas (`txt.includes(',')`). Use CSV_DELIMITER=comma unless you also change JS.")
 
     sess = _session()
-
     event_ids = _iter_event_ids(cfg, sess)
     _debug(cfg, f"[mec] Total unique event IDs: {len(event_ids)}")
 
