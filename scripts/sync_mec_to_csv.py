@@ -49,8 +49,7 @@ def _to_state_abbr(s: str) -> str:
         return ""
     if len(s) == 2 and s.isalpha():
         return s.upper()
-    k = s.lower()
-    return _STATE_ABBR.get(k, s)
+    return _STATE_ABBR.get(s.lower(), s)
 
 
 def _norm(s: str) -> str:
@@ -161,6 +160,16 @@ def _extract_event_id(item: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _extract_event_ids(list_payload: Any) -> List[int]:
+    items = _flatten_events_payload(list_payload)
+    ids: List[int] = []
+    for it in items:
+        eid = _extract_event_id(it)
+        if eid is not None:
+            ids.append(eid)
+    return sorted(set(ids))
+
+
 def _pick_first_dict_value(d: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(d, dict) or not d:
         return None
@@ -233,12 +242,11 @@ def _parse_date_flexible(s: str) -> Optional[date]:
     s = (s or "").strip()
     if not s:
         return None
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%-m/%-d/%Y", "%-m/%-d/%y"):
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(s, fmt).date()
         except Exception:
             pass
-    # last resort: try very simple M/D/YYYY without %-m (Windows incompat)
     m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", s)
     if m:
         try:
@@ -246,6 +254,14 @@ def _parse_date_flexible(s: str) -> Optional[date]:
         except Exception:
             return None
     return None
+
+
+def _to_mdy(s: str) -> str:
+    """Force CSV output dates to M/D/YYYY so the schedule page keeps working."""
+    d = _parse_date_flexible(s)
+    if not d:
+        return (s or "").strip()
+    return f"{d.month}/{d.day}/{d.year}"
 
 
 def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
@@ -296,9 +312,9 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
         s_obj = b.get("start") or {}
         e_obj = b.get("end") or {}
 
-        s_date = str(s_obj.get("date") or "").strip()
-        e_date = str(e_obj.get("date") or s_date or "").strip()
-        if not s_date:
+        s_date_raw = str(s_obj.get("date") or "").strip()
+        e_date_raw = str(e_obj.get("date") or s_date_raw or "").strip()
+        if not s_date_raw:
             continue
 
         allday = str(b.get("allday") or "0").strip().lower() in {"1", "true", "yes"}
@@ -307,15 +323,15 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
         start_time = "" if (allday or hide_time) else _format_time(s_obj.get("hour"), s_obj.get("minutes"), s_obj.get("ampm"))
         stop_time = "" if (allday or hide_time) else _format_time(e_obj.get("hour"), e_obj.get("minutes"), e_obj.get("ampm"))
 
-        sd = _parse_date_flexible(s_date)
-        ed = _parse_date_flexible(e_date)
+        sd = _parse_date_flexible(s_date_raw)
+        ed = _parse_date_flexible(e_date_raw)
         if sd and ed and (ed - sd).days > max_span_days:
             continue
 
         out.append(
             {
-                "start_date": s_date,
-                "end_date": e_date,
+                "start_date": _to_mdy(s_date_raw),
+                "end_date": _to_mdy(e_date_raw),
                 "start_time": start_time,
                 "stop_time": stop_time,
             }
@@ -386,9 +402,6 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
         _set_by_alias(row, hmap, ["title"], title)
         _set_by_alias(row, hmap, ["url"], url)
 
-        site_value = ", ".join([p for p in [loc["city"], loc["state"]] if p])
-        _set_by_alias(row, hmap, ["site"], site_value)
-
         _set_by_alias(row, hmap, ["telehealth"], _yn(ctype["telehealth"]))
 
         _set_by_alias(row, hmap, ["start_date", "start date"], occ["start_date"])
@@ -404,6 +417,7 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
         _set_by_alias(row, hmap, ["vision"], _yn(svc["vision"]))
         _set_by_alias(row, hmap, ["dentures"], _yn(svc["dentures"]))
 
+        # safety: fill if header variants exist
         for col, val in [
             (_find_header_contains(header, "start", "date"), occ["start_date"]),
             (_find_header_contains(header, "end", "date"), occ["end_date"]),
@@ -418,19 +432,8 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
     return rows
 
 
-def _extract_event_ids(list_payload: Any) -> List[int]:
-    items = _flatten_events_payload(list_payload)
-    ids: List[int] = []
-    for it in items:
-        eid = _extract_event_id(it)
-        if eid is not None:
-            ids.append(eid)
-    return sorted(set(ids))
-
-
 def _sort_key(row: Dict[str, str]):
     d = _parse_date_flexible(row.get("start_date") or "")
-    # blanks go last
     return (d is None, d or date.max, (row.get("title") or "").lower())
 
 
@@ -529,7 +532,6 @@ def main() -> None:
         detail = _mec_get(base_url, token, f"events/{eid}", params=detail_params, debug=debug)
         all_rows.extend(_build_rows_for_event(detail, header, max_span_days=max_span_days, debug=debug))
 
-    # Sort rows by start_date so GitHub file is always ordered
     all_rows.sort(key=_sort_key)
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
