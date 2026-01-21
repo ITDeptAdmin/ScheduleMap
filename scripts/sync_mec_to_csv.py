@@ -23,7 +23,7 @@ import csv
 import os
 import re
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -49,7 +49,7 @@ def _to_state_abbr(s: str) -> str:
         return ""
     if len(s) == 2 and s.isalpha():
         return s.upper()
-    k = s.strip().lower()
+    k = s.lower()
     return _STATE_ABBR.get(k, s)
 
 
@@ -73,11 +73,6 @@ def _strip_html(html: str) -> str:
 def _read_existing_header(csv_path: str) -> Optional[List[str]]:
     if not os.path.exists(csv_path):
         return None
-        def _sort_key(row: Dict[str, str]):
-    # start_date can be YYYY-MM-DD or empty
-    s = (row.get("start_date") or "").strip()
-    # Put blanks at the end
-    return (s == "", s, (row.get("title") or "").lower())
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         r = csv.reader(f)
         try:
@@ -203,7 +198,6 @@ def _extract_custom_fields(event_data: Dict[str, Any]) -> Dict[str, str]:
             out["services"] = value
         elif label in {"clinic type", "clinictype"}:
             out["clinic_type"] = value
-        # accept multiple label styles for parking
         elif label in {"parking_date", "parking date"}:
             out["parking_date"] = value
         elif label in {"parking_time", "parking time"} or label.startswith("parking_time"):
@@ -235,18 +229,23 @@ def _clinic_type_flags(clinic_type_value: str, fallback_text: str) -> Dict[str, 
     return {"telehealth": has("telehealth"), "popup": has("popup")}
 
 
-def _parse_ymd(s: str) -> Optional[date]:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
+def _parse_date_flexible(s: str) -> Optional[date]:
+    s = (s or "").strip()
+    if not s:
         return None
-
-
-def _ymd_to_mdy(s: str) -> str:
-    d = _parse_ymd(s)
-    if not d:
-        return s or ""
-    return f"{d.month}/{d.day}/{d.year}"
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%-m/%-d/%Y", "%-m/%-d/%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    # last resort: try very simple M/D/YYYY without %-m (Windows incompat)
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", s)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        except Exception:
+            return None
+    return None
 
 
 def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
@@ -308,20 +307,21 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
         start_time = "" if (allday or hide_time) else _format_time(s_obj.get("hour"), s_obj.get("minutes"), s_obj.get("ampm"))
         stop_time = "" if (allday or hide_time) else _format_time(e_obj.get("hour"), e_obj.get("minutes"), e_obj.get("ampm"))
 
-        sd = _parse_ymd(s_date)
-        ed = _parse_ymd(e_date)
+        sd = _parse_date_flexible(s_date)
+        ed = _parse_date_flexible(e_date)
         if sd and ed and (ed - sd).days > max_span_days:
             continue
 
         out.append(
             {
-                "start_date": _ymd_to_mdy(s_date),
-                "end_date": _ymd_to_mdy(e_date),
+                "start_date": s_date,
+                "end_date": e_date,
                 "start_time": start_time,
                 "stop_time": stop_time,
             }
         )
 
+    # de-dupe
     seen = set()
     uniq: List[Dict[str, str]] = []
     for o in out:
@@ -344,12 +344,7 @@ def _extract_canceled(event_data: Dict[str, Any]) -> bool:
     return "cancel" in status.lower()
 
 
-def _build_rows_for_event(
-    detail: Dict[str, Any],
-    header: List[str],
-    max_span_days: int,
-    debug: bool,
-) -> List[Dict[str, str]]:
+def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_days: int, debug: bool) -> List[Dict[str, str]]:
     data = detail.get("data", {})
     post = data.get("post", {}) if isinstance(data, dict) else {}
     content_html = post.get("post_content") or post.get("post_content_filtered") or ""
@@ -433,6 +428,12 @@ def _extract_event_ids(list_payload: Any) -> List[int]:
     return sorted(set(ids))
 
 
+def _sort_key(row: Dict[str, str]):
+    d = _parse_date_flexible(row.get("start_date") or "")
+    # blanks go last
+    return (d is None, d or date.max, (row.get("title") or "").lower())
+
+
 def main() -> None:
     base_url = os.environ.get("MEC_BASE_URL", "").strip()
     token = os.environ.get("MEC_TOKEN", "").strip()
@@ -460,7 +461,6 @@ def main() -> None:
             "medical","dental","vision","dentures","url",
         ]
 
-    # List params: include past + all statuses (best-effort; MEC installs vary)
     base_params = {"start": start, "end": end, "limit": limit}
     bonus_flags = [
         {"show_past_events": "1"},
@@ -470,7 +470,6 @@ def main() -> None:
         {"status": "all"},
     ]
 
-    # Try a few variants and keep the one that returns the most IDs
     best_ids: List[int] = []
     best_params = dict(base_params)
 
@@ -478,15 +477,12 @@ def main() -> None:
         p = dict(base_params)
         p.update(extra)
         payload = _mec_get(base_url, token, "events", params=p, debug=debug)
-        ids = _extract_event_ids(payload)
-        return ids
+        return _extract_event_ids(payload)
 
-    # start with base
     best_ids = try_list({})
     if debug:
         print(f"[mec] IDs (base): {len(best_ids)}")
 
-    # try combos cumulatively
     current_extra: Dict[str, str] = {}
     for flag in bonus_flags:
         current_extra.update(flag)
@@ -498,13 +494,12 @@ def main() -> None:
             best_params = dict(base_params)
             best_params.update(current_extra)
 
-    # NOTE: paging support varies; many MEC installs ignore page params.
-    # We still attempt it; if IDs don't change, we stop early.
     all_ids = set(best_ids)
     if debug:
-        print(f"[mec] Trying paging (best_params)")
+        print("[mec] Trying paging (best_params)")
 
     for page in range(2, max_pages + 1):
+        grew = False
         for page_key in ("page", "paged"):
             p = dict(best_params)
             p[page_key] = str(page)
@@ -512,14 +507,13 @@ def main() -> None:
             ids = _extract_event_ids(payload)
             before = len(all_ids)
             all_ids.update(ids)
+            after = len(all_ids)
             if debug:
-                print(f"[mec] {page_key}={page} -> {len(ids)} IDs (unique now {len(all_ids)})")
-            # if nothing new, likely ignored
-            if len(all_ids) == before:
-                break
-        else:
-            continue
-        break
+                print(f"[mec] {page_key}={page} -> {len(ids)} IDs (unique now {after})")
+            if after > before:
+                grew = True
+        if not grew:
+            break
 
     event_ids = sorted(all_ids)
     if not event_ids:
@@ -528,13 +522,15 @@ def main() -> None:
     if debug:
         print(f"[mec] Total unique event IDs: {len(event_ids)}")
 
-    # Build rows: call detail with the same date range (helps some MEC installs expand recurrences)
     all_rows: List[Dict[str, str]] = []
-    detail_params = dict(best_params)  # includes start/end and any include_past-ish flags
+    detail_params = dict(best_params)
 
     for eid in event_ids:
         detail = _mec_get(base_url, token, f"events/{eid}", params=detail_params, debug=debug)
         all_rows.extend(_build_rows_for_event(detail, header, max_span_days=max_span_days, debug=debug))
+
+    # Sort rows by start_date so GitHub file is always ordered
+    all_rows.sort(key=_sort_key)
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
