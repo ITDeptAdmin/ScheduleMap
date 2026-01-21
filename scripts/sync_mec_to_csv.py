@@ -3,27 +3,29 @@
 """
 Sync Modern Events Calendar (MEC) events to a GitHub-tracked CSV.
 
-Why your map shows 0 dots right now:
-- Your Schedule page's JS only accepts the CSV response as "valid" if it contains commas.
-  It explicitly checks: `txt.includes(",")`.
-- If you output TSV (tabs), that check fails and the page silently falls back to old/empty text.
-
-This script defaults to COMMA CSV for map compatibility.
+Key behavior:
+- Writes comma CSV by default (your schedule JS requires commas).
+- Expands occurrences into rows.
+- Skips 404s gracefully.
+- Services (medical/dental/vision/dentures) are derived ONLY from:
+  1) MEC custom field "Services" (preferred)
+  2) structured taxonomies (categories/tags/labels) as fallback
+  NOT from full HTML body text (avoids false positives from boilerplate).
 
 Required env vars:
-- MEC_BASE_URL: e.g. https://www.ramusa.org/wp-json/mec/v1.0
-- MEC_TOKEN: MEC API key (sent as header: mec-token)
-- CSV_PATH: output filename in repo, e.g. "Clinic Master Schedule for git.csv"
+- MEC_BASE_URL
+- MEC_TOKEN
+- CSV_PATH
 
 Optional env vars:
-- MEC_START: YYYY-MM-DD (default: 2010-01-01)
-- MEC_END:   YYYY-MM-DD (default: 2030-12-31)
-- MEC_LIMIT: int (default: 200)
-- MAX_PAGES: int (default: 50)
-- MAX_SPAN_DAYS: int (default: 10)   # maximum allowed duration of a single occurrence
-- CSV_DELIMITER: "comma" or "tab" (default: comma)  # you WANT comma for your current JS
-- DATE_FORMAT: "mdy" or "ymd" (default: mdy)
-- MEC_DEBUG: "1" to print diagnostics
+- MEC_START (default 2010-01-01)
+- MEC_END (default 2030-12-31)
+- MEC_LIMIT (default 200)
+- MAX_PAGES (default 50)
+- MAX_SPAN_DAYS (default 10)
+- CSV_DELIMITER: "comma" or "tab" (default comma)
+- DATE_FORMAT: "mdy" or "ymd" (default mdy)
+- MEC_DEBUG: "1"
 """
 
 from __future__ import annotations
@@ -92,16 +94,6 @@ def _to_state_abbr(s: str) -> str:
     if len(s) == 2 and s.isalpha():
         return s.upper()
     return _STATE_ABBR.get(s.lower(), s)
-
-
-def _strip_html(html: str) -> str:
-    if not html:
-        return ""
-    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-    text = re.sub(r"</p\s*>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"&nbsp;?", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def _yn(v: bool) -> str:
@@ -175,7 +167,7 @@ def _debug(cfg: Cfg, msg: str) -> None:
 
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "ram-mec-sync/1.0"})
+    s.headers.update({"User-Agent": "ram-mec-sync/1.1"})
     return s
 
 
@@ -191,7 +183,6 @@ def _mec_get(
     url = cfg.base_url.rstrip("/") + "/" + path.lstrip("/")
     headers = {"mec-token": cfg.token}
 
-    last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
             resp = sess.get(url, headers=headers, params=params, timeout=60)
@@ -200,25 +191,20 @@ def _mec_get(
             if allow_404 and resp.status_code == 404:
                 return resp
 
-            if resp.status_code in {429, 500, 502, 503, 504}:
-                if attempt < retries:
-                    backoff = 2 ** attempt
-                    _debug(cfg, f"[mec] retryable {resp.status_code}; sleeping {backoff}s")
-                    time.sleep(backoff)
-                    continue
+            if resp.status_code in {429, 500, 502, 503, 504} and attempt < retries:
+                backoff = 2 ** attempt
+                _debug(cfg, f"[mec] retryable {resp.status_code}; sleeping {backoff}s")
+                time.sleep(backoff)
+                continue
 
             return resp
         except Exception as e:
-            last_exc = e
             if attempt < retries:
                 backoff = 2 ** attempt
                 _debug(cfg, f"[mec] exception {type(e).__name__}: {e}; sleeping {backoff}s")
                 time.sleep(backoff)
                 continue
             raise
-
-    if last_exc:
-        raise last_exc
     raise RuntimeError("unreachable")
 
 
@@ -245,7 +231,6 @@ def _flatten_events_payload(payload: Any) -> List[Dict[str, Any]]:
                 for v in ev.values():
                     add_list(v)
                 return out
-
         for v in payload.values():
             add_list(v)
         return out
@@ -318,8 +303,50 @@ def _extract_custom_fields(event_data: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
-def _services_flags(services_value: str, fallback_text: str) -> Dict[str, bool]:
-    src = services_value.strip() or fallback_text
+def _extract_taxonomy_text(event_data: Dict[str, Any]) -> str:
+    """
+    Safely extracts names from structured taxonomies (categories/tags/labels).
+    Avoids scanning full HTML/event description which often contains boilerplate.
+    """
+    chunks: List[str] = []
+
+    def take_names(obj: Any) -> None:
+        if obj is None:
+            return
+        if isinstance(obj, dict):
+            for v in obj.values():
+                take_names(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                take_names(it)
+        else:
+            s = str(obj).strip()
+            if s and len(s) <= 80:
+                chunks.append(s)
+
+    for key in ("categories", "category", "tags", "tag", "labels", "label", "terms", "term"):
+        if key in event_data:
+            take_names(event_data.get(key))
+
+    # Also include the title (often contains "Dental", "Vision", etc.)
+    title = str(event_data.get("title") or "").strip()
+    if title:
+        chunks.append(title)
+
+    txt = " ".join(chunks)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+def _services_flags(services_value: str, safe_fallback_text: str) -> Dict[str, bool]:
+    """
+    IMPORTANT:
+    - We do NOT use HTML body text because it can contain generic lists of services.
+    - We only use custom field 'Services' or structured taxonomies (categories/tags/labels) as fallback.
+    """
+    src = (services_value or "").strip()
+    if not src:
+        src = (safe_fallback_text or "").strip()
 
     def has(w: str) -> bool:
         return w.lower() in src.lower()
@@ -332,8 +359,8 @@ def _services_flags(services_value: str, fallback_text: str) -> Dict[str, bool]:
     }
 
 
-def _clinic_type_flags(clinic_type_value: str, fallback_text: str) -> Dict[str, bool]:
-    src = clinic_type_value.strip() or fallback_text
+def _clinic_type_flags(clinic_type_value: str, safe_fallback_text: str) -> Dict[str, bool]:
+    src = (clinic_type_value or "").strip() or (safe_fallback_text or "").strip()
 
     def has(w: str) -> bool:
         return w.lower() in src.lower()
@@ -352,11 +379,6 @@ def _extract_canceled(event_data: Dict[str, Any]) -> bool:
 
 
 def _find_occurrence_blocks_anywhere(obj: Any) -> Iterable[Dict[str, Any]]:
-    """
-    MEC responses vary. This finds dict blocks shaped like:
-      { "start": {"date": ...}, "end": {"date": ...}, ... }
-    anywhere in the response.
-    """
     stack = [obj]
     while stack:
         cur = stack.pop()
@@ -426,27 +448,26 @@ def _safe_site(city: str, state: str) -> str:
 
 def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any]) -> List[Dict[str, str]]:
     data = detail.get("data", {})
-    post = data.get("post", {}) if isinstance(data, dict) else {}
-    content_html = post.get("post_content") or post.get("post_content_filtered") or ""
-    content_text = _strip_html(str(content_html))
+    if not isinstance(data, dict):
+        data = {}
 
-    loc = _extract_location(data if isinstance(data, dict) else {})
-    fields = _extract_custom_fields(data if isinstance(data, dict) else {})
-    svc = _services_flags(fields.get("services", ""), content_text)
-    ctype = _clinic_type_flags(fields.get("clinic_type", ""), content_text)
-    canceled = _extract_canceled(data if isinstance(data, dict) else {})
+    loc = _extract_location(data)
+    fields = _extract_custom_fields(data)
 
+    safe_tax_text = _extract_taxonomy_text(data)
+    svc = _services_flags(fields.get("services", ""), safe_tax_text)
+    ctype = _clinic_type_flags(fields.get("clinic_type", ""), safe_tax_text)
+
+    canceled = _extract_canceled(data)
     parking_date = fields.get("parking_date", "").strip()
     parking_time = fields.get("parking_time", "").strip()
 
-    title = str((data.get("title") if isinstance(data, dict) else "") or post.get("post_title") or "").strip()
-    url = str((data.get("permalink") if isinstance(data, dict) else "") or "").strip() or str(post.get("guid") or "").strip()
+    title = str(data.get("title") or "").strip()
+    url = str(data.get("permalink") or "").strip()
 
     occurrences = _extract_occurrences(detail, max_span_days=cfg.max_span_days, date_format=cfg.date_format)
     if cfg.debug and not occurrences:
-        eid = None
-        if isinstance(data, dict):
-            eid = data.get("ID") or data.get("id")
+        eid = data.get("ID") or data.get("id")
         _debug(cfg, f"[warn] No occurrences parsed for event {eid} title={title!r}")
 
     if not occurrences:
@@ -494,7 +515,6 @@ def _iter_event_ids(cfg: Cfg, sess: requests.Session) -> List[int]:
             raise SystemExit(f"MEC /events failed: HTTP {resp.status_code} url={resp.url}")
         return _extract_event_ids(resp.json())
 
-    # MEC sometimes uses `page`, sometimes `paged`. Detect which actually advances.
     ids_page1 = fetch_page("page", 1)
     ids_page2 = fetch_page("page", 2) if cfg.max_pages >= 2 else []
     uses_page = bool(set(ids_page2) - set(ids_page1))
@@ -631,7 +651,6 @@ def main() -> None:
         all_rows.extend(_build_rows_for_event(cfg, detail))
 
     _write_csv(cfg, all_rows)
-
     print(f"Wrote {len(all_rows)} rows to {cfg.csv_path} (skipped_404={skipped_404})")
 
 
