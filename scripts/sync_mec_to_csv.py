@@ -9,7 +9,7 @@ Required env vars:
 - CSV_PATH: output CSV filename in repo, e.g. "Clinic Master Schedule for git.csv"
 
 Optional env vars:
-- MEC_START: YYYY-MM-DD (default: 2025-01-01)
+- MEC_START: YYYY-MM-DD (default: 2026-01-01)
 - MEC_END:   YYYY-MM-DD (default: 2027-12-31)
 - MEC_LIMIT: int (default: 200)
 - MAX_SPAN_DAYS: int (default: 10)  # skips suspiciously long occurrences from repeat rules
@@ -23,25 +23,23 @@ import os
 import re
 import time
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 
 US_STATE_ABBR = {
-    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
-    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "district of columbia": "DC",
     "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID", "illinois": "IL",
     "indiana": "IN", "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA",
-    "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI",
-    "minnesota": "MN", "mississippi": "MS", "missouri": "MO", "montana": "MT",
-    "nebraska": "NE", "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
-    "new mexico": "NM", "new york": "NY", "north carolina": "NC", "north dakota": "ND",
-    "ohio": "OH", "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA",
-    "rhode island": "RI", "south carolina": "SC", "south dakota": "SD", "tennessee": "TN",
-    "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
-    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
-    "district of columbia": "DC",
+    "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC", "south dakota": "SD",
+    "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA",
+    "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
 }
 
 
@@ -100,34 +98,46 @@ def _yn(b: bool) -> str:
     return "Yes" if b else "No"
 
 
-def _coerce_state_to_abbr(state_raw: str) -> str:
-    s = (state_raw or "").strip()
+def _coerce_state_abbr(state_val: str) -> str:
+    s = (state_val or "").strip()
     if not s:
         return ""
-    if len(s) == 2:
+    if len(s) == 2 and s.isalpha():
         return s.upper()
-    key = s.lower().strip()
-    return US_STATE_ABBR.get(key, s)  # fallback: leave as-is if unknown
+    key = s.strip().lower()
+    return US_STATE_ABBR.get(key, s)  # fallback to original if unknown
 
 
-def _mec_get(base_url: str, token: str, path: str, params: Optional[dict] = None, retries: int = 6) -> Any:
+def _ymd_to_mdy(ymd: str) -> str:
+    """
+    Convert 'YYYY-MM-DD' -> 'M/D/YYYY' (no zero padding).
+    If parsing fails, return original.
+    """
+    try:
+        d = datetime.strptime(ymd, "%Y-%m-%d").date()
+        return f"{d.month}/{d.day}/{d.year}"
+    except Exception:
+        return ymd or ""
+
+
+def _mec_get(base_url: str, token: str, path: str, params: Optional[dict] = None, tries: int = 5) -> Any:
     url = base_url.rstrip("/") + "/" + path.lstrip("/")
     last_err: Optional[Exception] = None
 
-    for attempt in range(retries):
+    for i in range(tries):
         try:
             r = requests.get(url, headers={"mec-token": token}, params=params, timeout=60)
-            # MEC sometimes throws transient 500s; include body to debug when it persists.
+            # Retry on transient server errors
             if r.status_code >= 500:
-                raise requests.HTTPError(f"{r.status_code} Server Error: {r.text[:500]}", response=r)
+                raise requests.HTTPError(f"{r.status_code} Server Error for url: {r.url}", response=r)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_err = e
-            # backoff: 1s, 2s, 4s, 8s...
-            time.sleep(min(30, 2 ** attempt))
+            # small backoff
+            time.sleep(1.5 * (i + 1))
 
-    raise last_err if last_err else RuntimeError("MEC request failed")
+    raise last_err  # type: ignore[misc]
 
 
 def _flatten_events_payload(payload: Any) -> List[Dict[str, Any]]:
@@ -175,22 +185,113 @@ def _extract_event_ids(list_payload: Any) -> List[int]:
     return sorted(set(ids))
 
 
-def _pick_first_dict_value(d: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(d, dict) or not d:
+def _list_all_event_ids(
+    base_url: str,
+    token: str,
+    start: str,
+    end: str,
+    limit: int,
+    debug: bool,
+) -> List[int]:
+    """
+    Paginate /events. MEC installs vary; some use page, some offset, some return all.
+    We send BOTH page and offset; if the API ignores one, the other may work.
+    We stop when we stop seeing new IDs.
+    """
+    all_ids: List[int] = []
+    seen: set[int] = set()
+
+    page = 1
+    empty_streak = 0
+
+    while True:
+        offset = (page - 1) * limit
+        params = {"start": start, "end": end, "limit": str(limit), "page": str(page), "offset": str(offset)}
+        if debug:
+            print(f"[list] page={page} offset={offset} params={params}")
+
+        payload = _mec_get(base_url, token, "events", params=params)
+        ids = _extract_event_ids(payload)
+
+        new = [i for i in ids if i not in seen]
+        for i in new:
+            seen.add(i)
+            all_ids.append(i)
+
+        if debug:
+            print(f"[list] got={len(ids)} new={len(new)} total={len(all_ids)}")
+
+        # Stop conditions:
+        # - no ids returned
+        # - or no *new* ids for 2 pages in a row
+        # - or returned fewer than limit (common pagination behavior)
+        if not ids:
+            break
+
+        if not new:
+            empty_streak += 1
+        else:
+            empty_streak = 0
+
+        if empty_streak >= 2:
+            break
+
+        if len(ids) < limit:
+            break
+
+        page += 1
+
+        # hard safety cap
+        if page > 200:
+            if debug:
+                print("[list] stopping at page cap=200")
+            break
+
+    return all_ids
+
+
+def _pick_first_location(locations_obj: Any) -> Optional[Dict[str, Any]]:
+    """
+    MEC sometimes provides locations as:
+      - dict: { "123": {..loc..}, "456": {...} }
+      - list: [ {..loc..}, {...} ]
+      - dict under different key: "location"
+    """
+    if isinstance(locations_obj, dict):
+        # If dict is already a location object (has name/address), use it
+        if any(k in locations_obj for k in ("name", "address", "latitude", "longitude", "city", "state")):
+            return locations_obj
+        # Else treat as id->location mapping
+        for k in sorted(locations_obj.keys(), key=lambda x: str(x)):
+            v = locations_obj.get(k)
+            if isinstance(v, dict):
+                return v
         return None
-    first_key = sorted(d.keys(), key=lambda x: str(x))[0]
-    v = d.get(first_key)
-    return v if isinstance(v, dict) else None
+
+    if isinstance(locations_obj, list):
+        for it in locations_obj:
+            if isinstance(it, dict):
+                return it
+        return None
+
+    return None
 
 
 def _extract_location(event_data: Dict[str, Any]) -> Dict[str, str]:
-    loc = _pick_first_dict_value(event_data.get("locations", {})) or {}
-    state_raw = str(loc.get("state", "")).strip()
+    loc = (
+        _pick_first_location(event_data.get("locations"))
+        or _pick_first_location(event_data.get("location"))
+        or _pick_first_location((event_data.get("data") or {}).get("locations") if isinstance(event_data.get("data"), dict) else None)
+        or {}
+    )
+
+    state = _coerce_state_abbr(str(loc.get("state", "")).strip())
+
     return {
         "facility": str(loc.get("name", "")).strip(),
         "address": str(loc.get("address", "")).strip(),
         "city": str(loc.get("city", "")).strip(),
-        "state": _coerce_state_to_abbr(state_raw),
+        "state": state,
         "lat": str(loc.get("latitude", "")).strip(),
         "lng": str(loc.get("longitude", "")).strip(),
     }
@@ -265,7 +366,8 @@ def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
     ap = str(ampm or "").strip().lower()
     if ap not in {"am", "pm"}:
         return ""
-    return f"{h}:{m:02d} {ap.upper()}"
+    ap_up = ap.upper()
+    return f"{h}:{m:02d} {ap_up}"
 
 
 def _detail_dates_blocks(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -316,13 +418,14 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
 
         out.append(
             {
-                "start_date": s_date,
-                "end_date": e_date,
+                "start_date": _ymd_to_mdy(s_date),
+                "end_date": _ymd_to_mdy(e_date),
                 "start_time": start_time,
                 "stop_time": stop_time,
             }
         )
 
+    # de-dupe
     seen = set()
     uniq: List[Dict[str, str]] = []
     for o in out:
@@ -348,6 +451,7 @@ def _extract_canceled(event_data: Dict[str, Any]) -> bool:
 def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_days: int, debug: bool) -> List[Dict[str, str]]:
     data = detail.get("data", {})
     post = data.get("post", {}) if isinstance(data, dict) else {}
+
     content_html = post.get("post_content") or post.get("post_content_filtered") or ""
     content_text = _strip_html(str(content_html))
 
@@ -405,6 +509,7 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
         _set_by_alias(row, hmap, ["vision"], _yn(svc["vision"]))
         _set_by_alias(row, hmap, ["dentures"], _yn(svc["dentures"]))
 
+        # extra safety for slight header variants
         for col, val in [
             (_find_header_contains(header, "start", "date"), occ["start_date"]),
             (_find_header_contains(header, "end", "date"), occ["end_date"]),
@@ -414,67 +519,14 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
             if col and not row.get(col):
                 row[col] = val
 
+        # debug missing coords
+        if debug and (not row.get(hmap.get("lat", "lat")) or not row.get(hmap.get("lng", "lng"))):
+            eid = data.get("ID") or data.get("id") or (data.get("post") or {}).get("ID")
+            print(f"[warn] Missing lat/lng for event={eid} title={title!r} url={url}")
+
         rows.append(row)
 
     return rows
-
-
-def _list_all_event_ids(base_url: str, token: str, start: str, end: str, limit: int, debug: bool) -> List[int]:
-    """
-    MEC /events is paginated. Keep requesting until pagination.has_more_events is false.
-    Uses documented params: start_date, end_date, limit, offset, order. :contentReference[oaicite:1]{index=1}
-    """
-    ids: Set[int] = set()
-    start_date = start
-    offset = 0
-    guard = 0
-
-    while True:
-        guard += 1
-        if guard > 5000:
-            raise RuntimeError("Pagination guard tripped (too many pages). Check MEC pagination response.")
-
-        params = {
-            "start_date": start_date,
-            "end_date": end,
-            "limit": int(limit),
-            "offset": int(offset),
-            "order": "ASC",
-        }
-        payload = _mec_get(base_url, token, "events", params=params)
-        got = _extract_event_ids(payload)
-        ids.update(got)
-
-        pag = payload.get("pagination", {}) if isinstance(payload, dict) else {}
-        has_more = bool(pag.get("has_more_events"))
-        next_date = str(pag.get("next_date") or "").strip()
-        next_offset = pag.get("next_offset")
-
-        if debug:
-            found = pag.get("found")
-            print(f"[list] start_date={start_date} offset={offset} got_ids={len(got)} total_ids={len(ids)} has_more={has_more} found={found}")
-
-        if not has_more:
-            break
-
-        # Safety: prevent infinite loops if API returns same cursor repeatedly
-        if (not next_date) and (next_offset is None):
-            print("[warn] has_more_events=true but missing next_date/next_offset; stopping to avoid infinite loop.")
-            break
-
-        new_start = next_date or start_date
-        try:
-            new_offset = int(next_offset) if next_offset is not None else (offset + limit)
-        except Exception:
-            new_offset = offset + limit
-
-        if new_start == start_date and new_offset == offset:
-            print("[warn] pagination cursor did not advance; stopping to avoid infinite loop.")
-            break
-
-        start_date, offset = new_start, new_offset
-
-    return sorted(ids)
 
 
 def main() -> None:
@@ -482,7 +534,7 @@ def main() -> None:
     token = os.environ.get("MEC_TOKEN", "").strip()
     csv_path = os.environ.get("CSV_PATH", "").strip()
 
-    start = os.environ.get("MEC_START", "2025-01-01").strip()
+    start = os.environ.get("MEC_START", "2026-01-01").strip()
     end = os.environ.get("MEC_END", "2027-12-31").strip()
     limit = int((os.environ.get("MEC_LIMIT", "200").strip() or "200"))
     max_span_days = int(os.environ.get("MAX_SPAN_DAYS", "10").strip() or "10")
@@ -516,13 +568,12 @@ def main() -> None:
             "url",
         ]
 
-    # ✅ paginated list across full range
     event_ids = _list_all_event_ids(base_url, token, start=start, end=end, limit=limit, debug=debug)
     if not event_ids:
         raise SystemExit("No events returned from MEC /events endpoint. Try widening MEC_START/MEC_END.")
 
     if debug:
-        print(f"Found {len(event_ids)} unique event IDs in range {start}..{end}")
+        print(f"Found {len(event_ids)} event IDs total")
 
     all_rows: List[Dict[str, str]] = []
     for eid in event_ids:
