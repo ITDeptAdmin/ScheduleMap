@@ -35,7 +35,9 @@ jobs:
           MEC_LIMIT: "200"
           MAX_PAGES: "50"
           MAX_SPAN_DAYS: "10"
+          # IMPORTANT: make the output match your map
           CSV_DELIMITER: "tab"
+          DATE_FORMAT: "mdy"
           MEC_DEBUG: "1"
         run: |
           python scripts/sync_mec_to_csv.py
