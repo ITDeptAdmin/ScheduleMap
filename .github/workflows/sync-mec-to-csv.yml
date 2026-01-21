@@ -1,4 +1,4 @@
-name: Sync MEC events to TEST schedule CSV
+name: Sync MEC events to MAIN schedule CSV
 
 on:
   workflow_dispatch: {}
@@ -29,11 +29,11 @@ jobs:
         env:
           MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
           MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
-          CSV_PATH: "Clinic Master Schedule TEST.csv"
-          MEC_START: "2026-01-01"
+          CSV_PATH: "Clinic Master Schedule for git.csv"
+          MEC_START: "2025-01-01"
           MEC_END: "2027-12-31"
           MEC_LIMIT: "200"
-          MEC_DEBUG: "1"
+          MEC_DEBUG: "0"
         run: |
           python scripts/sync_mec_to_csv.py
 
@@ -46,5 +46,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Sync MEC events -> TEST schedule CSV"
+          git commit -m "Sync MEC events -> MAIN schedule CSV"
           git push
