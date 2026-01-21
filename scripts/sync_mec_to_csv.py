@@ -9,10 +9,12 @@ Required env vars:
 - CSV_PATH: output CSV filename in repo, e.g. "Clinic Master Schedule for git.csv"
 
 Optional env vars:
-- MEC_START: YYYY-MM-DD (default: 2026-01-01)
+- MEC_START: YYYY-MM-DD (default: 2025-01-01)  # IMPORTANT: include series that started earlier
 - MEC_END:   YYYY-MM-DD (default: 2027-12-31)
 - MEC_LIMIT: int (default: 200)
-- MAX_SPAN_DAYS: int (default: 10)  # skips suspiciously long occurrences from repeat rules
+- MAX_SPAN_DAYS: int (default: 10)   # skips suspiciously long occurrences from repeat rules
+- MEC_WINDOW_DAYS: int (default: 31) # queries MEC in smaller date windows to avoid missing/500s
+- MEC_PAGE_MAX: int (default: 20)    # tries paging if supported (safe if ignored)
 - MEC_DEBUG: "1" to print diagnostics
 """
 
@@ -22,27 +24,13 @@ import csv
 import os
 import re
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 
-US_STATE_ABBR = {
-    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
-    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "district of columbia": "DC",
-    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID", "illinois": "IL",
-    "indiana": "IN", "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA",
-    "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
-    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
-    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
-    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
-    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC", "south dakota": "SD",
-    "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA",
-    "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
-}
-
-
+# -------------------- Helpers --------------------
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
@@ -98,46 +86,47 @@ def _yn(b: bool) -> str:
     return "Yes" if b else "No"
 
 
-def _coerce_state_abbr(state_val: str) -> str:
-    s = (state_val or "").strip()
-    if not s:
-        return ""
-    if len(s) == 2 and s.isalpha():
-        return s.upper()
-    key = s.strip().lower()
-    return US_STATE_ABBR.get(key, s)  # fallback to original if unknown
-
-
-def _ymd_to_mdy(ymd: str) -> str:
-    """
-    Convert 'YYYY-MM-DD' -> 'M/D/YYYY' (no zero padding).
-    If parsing fails, return original.
-    """
+def _parse_ymd(s: str) -> Optional[date]:
     try:
-        d = datetime.strptime(ymd, "%Y-%m-%d").date()
-        return f"{d.month}/{d.day}/{d.year}"
+        return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
-        return ymd or ""
+        return None
 
 
-def _mec_get(base_url: str, token: str, path: str, params: Optional[dict] = None, tries: int = 5) -> Any:
+def _daterange_windows(start_s: str, end_s: str, window_days: int) -> List[Tuple[str, str]]:
+    sd = _parse_ymd(start_s)
+    ed = _parse_ymd(end_s)
+    if not sd or not ed:
+        raise SystemExit("MEC_START and MEC_END must be YYYY-MM-DD")
+
+    windows: List[Tuple[str, str]] = []
+    cur = sd
+    while cur <= ed:
+        w_end = min(ed, cur + timedelta(days=window_days - 1))
+        windows.append((cur.isoformat(), w_end.isoformat()))
+        cur = w_end + timedelta(days=1)
+    return windows
+
+
+# -------------------- MEC HTTP --------------------
+def _mec_get(session: requests.Session, base_url: str, token: str, path: str, params: Optional[dict] = None) -> Any:
     url = base_url.rstrip("/") + "/" + path.lstrip("/")
-    last_err: Optional[Exception] = None
+    headers = {"mec-token": token}
 
-    for i in range(tries):
+    # retry/backoff for common transient failures
+    backoff = 1.5
+    for attempt in range(1, 7):
         try:
-            r = requests.get(url, headers={"mec-token": token}, params=params, timeout=60)
-            # Retry on transient server errors
-            if r.status_code >= 500:
-                raise requests.HTTPError(f"{r.status_code} Server Error for url: {r.url}", response=r)
+            r = session.get(url, headers=headers, params=params, timeout=60)
+            if r.status_code in (500, 502, 503, 504, 429):
+                raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            last_err = e
-            # small backoff
-            time.sleep(1.5 * (i + 1))
-
-    raise last_err  # type: ignore[misc]
+            if attempt == 6:
+                raise
+            time.sleep(backoff)
+            backoff *= 1.8
 
 
 def _flatten_events_payload(payload: Any) -> List[Dict[str, Any]]:
@@ -185,113 +174,111 @@ def _extract_event_ids(list_payload: Any) -> List[int]:
     return sorted(set(ids))
 
 
-def _list_all_event_ids(
+def _collect_event_ids(
+    session: requests.Session,
     base_url: str,
     token: str,
     start: str,
     end: str,
-    limit: int,
+    limit: str,
+    window_days: int,
+    page_max: int,
     debug: bool,
 ) -> List[int]:
-    """
-    Paginate /events. MEC installs vary; some use page, some offset, some return all.
-    We send BOTH page and offset; if the API ignores one, the other may work.
-    We stop when we stop seeing new IDs.
-    """
-    all_ids: List[int] = []
-    seen: set[int] = set()
+    all_ids: set[int] = set()
 
-    page = 1
-    empty_streak = 0
+    windows = _daterange_windows(start, end, window_days)
+    if debug:
+        print(f"[info] Querying MEC in {len(windows)} windows of ~{window_days} days")
 
-    while True:
-        offset = (page - 1) * limit
-        params = {"start": start, "end": end, "limit": str(limit), "page": str(page), "offset": str(offset)}
-        if debug:
-            print(f"[list] page={page} offset={offset} params={params}")
+    for (w_start, w_end) in windows:
+        # Try paging if MEC supports it. If ignored, it’s harmless.
+        window_ids: set[int] = set()
+        for page in range(1, page_max + 1):
+            params = {"start": w_start, "end": w_end, "limit": limit, "page": str(page)}
+            payload = _mec_get(session, base_url, token, "events", params=params)
+            ids = _extract_event_ids(payload)
 
-        payload = _mec_get(base_url, token, "events", params=params)
-        ids = _extract_event_ids(payload)
-
-        new = [i for i in ids if i not in seen]
-        for i in new:
-            seen.add(i)
-            all_ids.append(i)
-
-        if debug:
-            print(f"[list] got={len(ids)} new={len(new)} total={len(all_ids)}")
-
-        # Stop conditions:
-        # - no ids returned
-        # - or no *new* ids for 2 pages in a row
-        # - or returned fewer than limit (common pagination behavior)
-        if not ids:
-            break
-
-        if not new:
-            empty_streak += 1
-        else:
-            empty_streak = 0
-
-        if empty_streak >= 2:
-            break
-
-        if len(ids) < limit:
-            break
-
-        page += 1
-
-        # hard safety cap
-        if page > 200:
             if debug:
-                print("[list] stopping at page cap=200")
-            break
+                print(f"[debug] window {w_start}..{w_end} page={page} ids={len(ids)}")
 
-    return all_ids
+            new = 0
+            for i in ids:
+                if i not in window_ids:
+                    window_ids.add(i)
+                    new += 1
+
+            # stop paging if nothing new appears
+            if not ids or new == 0:
+                break
+
+        all_ids |= window_ids
+
+    return sorted(all_ids)
 
 
-def _pick_first_location(locations_obj: Any) -> Optional[Dict[str, Any]]:
+# -------------------- Event parsing --------------------
+def _pick_location_from_locations(locations: Any, wanted_id: Optional[str]) -> Dict[str, Any]:
     """
-    MEC sometimes provides locations as:
-      - dict: { "123": {..loc..}, "456": {...} }
-      - list: [ {..loc..}, {...} ]
-      - dict under different key: "location"
+    MEC detail often provides locations as dict keyed by location_id -> {name,address,latitude,...}
+    We try:
+      1) exact match to wanted_id
+      2) first "best" (has lat/lng or address)
+      3) first dict value
     """
-    if isinstance(locations_obj, dict):
-        # If dict is already a location object (has name/address), use it
-        if any(k in locations_obj for k in ("name", "address", "latitude", "longitude", "city", "state")):
-            return locations_obj
-        # Else treat as id->location mapping
-        for k in sorted(locations_obj.keys(), key=lambda x: str(x)):
-            v = locations_obj.get(k)
-            if isinstance(v, dict):
+    if not isinstance(locations, dict) or not locations:
+        return {}
+
+    if wanted_id:
+        # sometimes ids are ints/strings
+        for k, v in locations.items():
+            if str(k) == str(wanted_id) and isinstance(v, dict):
                 return v
-        return None
 
-    if isinstance(locations_obj, list):
-        for it in locations_obj:
-            if isinstance(it, dict):
-                return it
-        return None
+    # pick best filled
+    best: Dict[str, Any] = {}
+    for v in locations.values():
+        if not isinstance(v, dict):
+            continue
+        lat = str(v.get("latitude", "")).strip()
+        lng = str(v.get("longitude", "")).strip()
+        addr = str(v.get("address", "")).strip()
+        if lat and lng:
+            return v
+        if addr and not best:
+            best = v
 
-    return None
+    if best:
+        return best
+
+    # fallback: first dict value
+    for v in locations.values():
+        if isinstance(v, dict):
+            return v
+    return {}
 
 
 def _extract_location(event_data: Dict[str, Any]) -> Dict[str, str]:
-    loc = (
-        _pick_first_location(event_data.get("locations"))
-        or _pick_first_location(event_data.get("location"))
-        or _pick_first_location((event_data.get("data") or {}).get("locations") if isinstance(event_data.get("data"), dict) else None)
-        or {}
-    )
+    locations = event_data.get("locations", {})
 
-    state = _coerce_state_abbr(str(loc.get("state", "")).strip())
+    # try to find a referenced location id
+    wanted_id = None
+    for key in ("location_id", "location", "mec_location_id"):
+        v = event_data.get(key)
+        if isinstance(v, (int, str)) and str(v).strip():
+            wanted_id = str(v).strip()
+            break
+        if isinstance(v, dict) and v.get("id"):
+            wanted_id = str(v.get("id")).strip()
+            break
+
+    loc = _pick_location_from_locations(locations, wanted_id)
 
     return {
         "facility": str(loc.get("name", "")).strip(),
         "address": str(loc.get("address", "")).strip(),
         "city": str(loc.get("city", "")).strip(),
-        "state": state,
+        "state": str(loc.get("state", "")).strip(),
         "lat": str(loc.get("latitude", "")).strip(),
         "lng": str(loc.get("longitude", "")).strip(),
     }
@@ -344,13 +331,6 @@ def _clinic_type_flags(clinic_type_value: str, fallback_text: str) -> Dict[str, 
     return {"telehealth": has("telehealth"), "popup": has("popup")}
 
 
-def _parse_ymd(s: str) -> Optional[date]:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-
 def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
     if hour in (None, "", "0", 0):
         return ""
@@ -366,8 +346,7 @@ def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
     ap = str(ampm or "").strip().lower()
     if ap not in {"am", "pm"}:
         return ""
-    ap_up = ap.upper()
-    return f"{h}:{m:02d} {ap_up}"
+    return f"{h}:{m:02d} {ap}"
 
 
 def _detail_dates_blocks(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -418,8 +397,8 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
 
         out.append(
             {
-                "start_date": _ymd_to_mdy(s_date),
-                "end_date": _ymd_to_mdy(e_date),
+                "start_date": s_date,
+                "end_date": e_date,
                 "start_time": start_time,
                 "stop_time": stop_time,
             }
@@ -451,7 +430,6 @@ def _extract_canceled(event_data: Dict[str, Any]) -> bool:
 def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_days: int, debug: bool) -> List[Dict[str, str]]:
     data = detail.get("data", {})
     post = data.get("post", {}) if isinstance(data, dict) else {}
-
     content_html = post.get("post_content") or post.get("post_content_filtered") or ""
     content_text = _strip_html(str(content_html))
 
@@ -519,25 +497,23 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
             if col and not row.get(col):
                 row[col] = val
 
-        # debug missing coords
-        if debug and (not row.get(hmap.get("lat", "lat")) or not row.get(hmap.get("lng", "lng"))):
-            eid = data.get("ID") or data.get("id") or (data.get("post") or {}).get("ID")
-            print(f"[warn] Missing lat/lng for event={eid} title={title!r} url={url}")
-
         rows.append(row)
 
     return rows
 
 
+# -------------------- Main --------------------
 def main() -> None:
     base_url = os.environ.get("MEC_BASE_URL", "").strip()
     token = os.environ.get("MEC_TOKEN", "").strip()
     csv_path = os.environ.get("CSV_PATH", "").strip()
 
-    start = os.environ.get("MEC_START", "2026-01-01").strip()
+    start = os.environ.get("MEC_START", "2025-01-01").strip()
     end = os.environ.get("MEC_END", "2027-12-31").strip()
-    limit = int((os.environ.get("MEC_LIMIT", "200").strip() or "200"))
+    limit = os.environ.get("MEC_LIMIT", "200").strip()
     max_span_days = int(os.environ.get("MAX_SPAN_DAYS", "10").strip() or "10")
+    window_days = int(os.environ.get("MEC_WINDOW_DAYS", "31").strip() or "31")
+    page_max = int(os.environ.get("MEC_PAGE_MAX", "20").strip() or "20")
     debug = os.environ.get("MEC_DEBUG", "").strip().lower() in {"1", "true", "yes", "y"}
 
     if not base_url or not token or not csv_path:
@@ -568,17 +544,35 @@ def main() -> None:
             "url",
         ]
 
-    event_ids = _list_all_event_ids(base_url, token, start=start, end=end, limit=limit, debug=debug)
-    if not event_ids:
-        raise SystemExit("No events returned from MEC /events endpoint. Try widening MEC_START/MEC_END.")
-
     if debug:
-        print(f"Found {len(event_ids)} event IDs total")
+        print(f"[info] MEC_BASE_URL={base_url}")
+        print(f"[info] Range {start}..{end} limit={limit} window_days={window_days} page_max={page_max}")
 
-    all_rows: List[Dict[str, str]] = []
-    for eid in event_ids:
-        detail = _mec_get(base_url, token, f"events/{eid}")
-        all_rows.extend(_build_rows_for_event(detail, header, max_span_days=max_span_days, debug=debug))
+    with requests.Session() as session:
+        event_ids = _collect_event_ids(
+            session=session,
+            base_url=base_url,
+            token=token,
+            start=start,
+            end=end,
+            limit=limit,
+            window_days=window_days,
+            page_max=page_max,
+            debug=debug,
+        )
+
+        if not event_ids:
+            raise SystemExit("No events returned from MEC /events endpoint. Try widening MEC_START/MEC_END.")
+
+        if debug:
+            print(f"[info] Found {len(event_ids)} unique event IDs")
+
+        all_rows: List[Dict[str, str]] = []
+        for i, eid in enumerate(event_ids, start=1):
+            if debug and i % 25 == 0:
+                print(f"[debug] fetching details {i}/{len(event_ids)}...")
+            detail = _mec_get(session, base_url, token, f"events/{eid}")
+            all_rows.extend(_build_rows_for_event(detail, header, max_span_days=max_span_days, debug=debug))
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
