@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # scripts/sync_mec_to_csv.py
 """
-Sync Modern Events Calendar (MEC) events to a GitHub-tracked CSV/TSV.
+Sync Modern Events Calendar (MEC) events to a GitHub-tracked CSV.
 
 Required env vars:
 - MEC_BASE_URL: e.g. https://www.ramusa.org/wp-json/mec/v1.0
 - MEC_TOKEN: MEC API key (sent as header: mec-token)
-- CSV_PATH: output filename in repo, e.g. "Clinic Master Schedule for git.csv"
+- CSV_PATH: output CSV filename in repo, e.g. "Clinic Master Schedule for git.csv"
 
 Optional env vars:
 - MEC_START: YYYY-MM-DD (default: 2010-01-01)
 - MEC_END:   YYYY-MM-DD (default: 2030-12-31)
 - MEC_LIMIT: int (default: 200)
-- MAX_PAGES: int (default: 50)      # best-effort paging attempts
-- MAX_SPAN_DAYS: int (default: 10)  # skip suspiciously long occurrences
-- CSV_DELIMITER: "auto" (default), "tab", or "comma"
+- MAX_PAGES: int (default: 50)   # best-effort paging attempts
+- MAX_SPAN_DAYS: int (default: 10)
+- CSV_DELIMITER: "tab" or "comma" (default: comma)
 - MEC_DEBUG: "1" to print diagnostics
 """
 
@@ -24,9 +24,10 @@ import csv
 import os
 import re
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
+
 
 # --- US state normalization (full name -> USPS) ---
 _STATE_ABBR = {
@@ -52,11 +53,13 @@ def _to_state_abbr(s: str) -> str:
     k = s.lower()
     return _STATE_ABBR.get(k, s)
 
+
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[()]", "", s)
     return s
+
 
 def _strip_html(html: str) -> str:
     if not html:
@@ -67,20 +70,27 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"&nbsp;?", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-def _parse_ymd(s: str) -> Optional[date]:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        return None
 
-def _ymd_to_mdy(s: str) -> str:
-    d = _parse_ymd(s)
-    if not d:
-        return (s or "").strip()
-    return f"{d.month}/{d.day}/{d.year}"
+def _csv_delimiter_from_env() -> str:
+    v = (os.environ.get("CSV_DELIMITER", "") or "").strip().lower()
+    return "\t" if v in {"tab", "tsv"} else ","
+
+
+def _read_existing_header(csv_path: str, delimiter: str) -> Optional[List[str]]:
+    if not os.path.exists(csv_path):
+        return None
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        r = csv.reader(f, delimiter=delimiter)
+        try:
+            header = next(r)
+            return header if header else None
+        except StopIteration:
+            return None
+
 
 def _header_map(header: List[str]) -> Dict[str, str]:
     return {_norm(h): h for h in header}
+
 
 def _set_by_alias(row: Dict[str, str], hmap: Dict[str, str], aliases: List[str], value: Any) -> None:
     v = "" if value is None else str(value)
@@ -90,6 +100,7 @@ def _set_by_alias(row: Dict[str, str], hmap: Dict[str, str], aliases: List[str],
             row[hmap[k]] = v
             return
 
+
 def _find_header_contains(header: List[str], *needles: str) -> Optional[str]:
     needles = [n.lower() for n in needles]
     for h in header:
@@ -98,8 +109,10 @@ def _find_header_contains(header: List[str], *needles: str) -> Optional[str]:
             return h
     return None
 
+
 def _yn(b: bool) -> str:
     return "Yes" if b else "No"
+
 
 def _mec_get(base_url: str, token: str, path: str, params: Optional[dict] = None, debug: bool = False) -> Any:
     url = base_url.rstrip("/") + "/" + path.lstrip("/")
@@ -112,69 +125,55 @@ def _mec_get(base_url: str, token: str, path: str, params: Optional[dict] = None
     r.raise_for_status()
     return r.json()
 
-# --- delimiter/header detection (preserve what the Schedule page expects) ---
-def _detect_existing_format(csv_path: str, forced: str) -> Tuple[Optional[List[str]], str]:
-    """
-    Returns (header_or_none, delimiter_to_use).
-    forced: "auto" | "tab" | "comma"
-    """
-    if forced == "tab":
-        delim = "\t"
-    elif forced == "comma":
-        delim = ","
-    else:
-        delim = ","  # default; may be overridden by file sniff
 
-    if not os.path.exists(csv_path):
-        return None, delim
+def _flatten_events_payload(payload: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
 
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        sample = f.read(4096)
-        f.seek(0)
+    def add_list(lst: Any) -> None:
+        if isinstance(lst, list):
+            for it in lst:
+                if isinstance(it, dict):
+                    out.append(it)
 
-        if forced == "auto":
-            # very simple reliable sniff: if tabs are common, treat as TSV
-            if sample.count("\t") > sample.count(","):
-                delim = "\t"
-            else:
-                delim = ","
+    if isinstance(payload, list):
+        add_list(payload)
+        return out
 
-        reader = csv.reader(f, delimiter=delim)
-        try:
-            header = next(reader)
-            return (header if header else None), delim
-        except StopIteration:
-            return None, delim
+    if isinstance(payload, dict):
+        if "events" in payload:
+            ev = payload.get("events")
+            if isinstance(ev, list):
+                add_list(ev)
+                return out
+            if isinstance(ev, dict):
+                for v in ev.values():
+                    add_list(v)
+                return out
 
-# --- payload parsing: recursively find any dict that has an ID-ish field ---
-_ID_KEYS = ("ID", "id", "post_id", "event_id")
+        for v in payload.values():
+            add_list(v)
+        return out
 
-def _maybe_id(d: Any) -> Optional[int]:
-    if not isinstance(d, dict):
-        return None
-    for k in _ID_KEYS:
-        if k in d and d.get(k) is not None:
+    return out
+
+
+def _looks_like_event(item: Dict[str, Any]) -> bool:
+    # Prevent grabbing random dicts that happen to have an "ID" key.
+    keys = set(item.keys())
+    eventish = {"title", "permalink", "date", "dates", "start", "end", "locations", "data", "post"}
+    return bool(keys & eventish)
+
+
+def _extract_event_id(item: Dict[str, Any]) -> Optional[int]:
+    # Prefer the keys that are most likely the MEC event post ID.
+    for k in ("event_id", "post_id", "ID", "id"):
+        if k in item and item.get(k) is not None:
             try:
-                return int(d.get(k))
+                return int(item.get(k))
             except Exception:
                 return None
     return None
 
-def _collect_ids_recursive(payload: Any, out: Set[int]) -> None:
-    if isinstance(payload, dict):
-        eid = _maybe_id(payload)
-        if eid is not None:
-            out.add(eid)
-        for v in payload.values():
-            _collect_ids_recursive(v, out)
-    elif isinstance(payload, list):
-        for it in payload:
-            _collect_ids_recursive(it, out)
-
-def _extract_event_ids(payload: Any) -> List[int]:
-    s: Set[int] = set()
-    _collect_ids_recursive(payload, s)
-    return sorted(s)
 
 def _pick_first_dict_value(d: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(d, dict) or not d:
@@ -182,6 +181,7 @@ def _pick_first_dict_value(d: Any) -> Optional[Dict[str, Any]]:
     first_key = sorted(d.keys(), key=lambda x: str(x))[0]
     v = d.get(first_key)
     return v if isinstance(v, dict) else None
+
 
 def _extract_location(event_data: Dict[str, Any]) -> Dict[str, str]:
     loc = _pick_first_dict_value(event_data.get("locations", {})) or {}
@@ -194,6 +194,7 @@ def _extract_location(event_data: Dict[str, Any]) -> Dict[str, str]:
         "lat": str(loc.get("latitude", "")).strip(),
         "lng": str(loc.get("longitude", "")).strip(),
     }
+
 
 def _extract_custom_fields(event_data: Dict[str, Any]) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -218,6 +219,7 @@ def _extract_custom_fields(event_data: Dict[str, Any]) -> Dict[str, str]:
 
     return out
 
+
 def _services_flags(services_value: str, fallback_text: str) -> Dict[str, bool]:
     src = services_value.strip() or fallback_text
 
@@ -231,13 +233,22 @@ def _services_flags(services_value: str, fallback_text: str) -> Dict[str, bool]:
         "dentures": has("denture"),
     }
 
+
 def _clinic_type_flags(clinic_type_value: str, fallback_text: str) -> Dict[str, bool]:
     src = clinic_type_value.strip() or fallback_text
 
     def has(w: str) -> bool:
         return w.lower() in src.lower()
 
-    return {"telehealth": has("telehealth"), "popup": has("pop-up") or has("popup")}
+    return {"telehealth": has("telehealth"), "popup": has("popup")}
+
+
+def _parse_ymd(s: str) -> Optional[date]:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
 
 def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
     if hour in (None, "", "0", 0):
@@ -254,7 +265,8 @@ def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
     ap = str(ampm or "").strip().lower()
     if ap not in {"am", "pm"}:
         return ""
-    return f"{h}:{m:02d} {ap.upper()}"
+    return f"{h}:{m:02d} {ap}"
+
 
 def _detail_dates_blocks(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
@@ -276,6 +288,7 @@ def _detail_dates_blocks(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
                 blocks.append(it)
 
     return blocks
+
 
 def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
@@ -301,14 +314,7 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
         if sd and ed and (ed - sd).days > max_span_days:
             continue
 
-        out.append(
-            {
-                "start_date": _ymd_to_mdy(s_date),
-                "end_date": _ymd_to_mdy(e_date),
-                "start_time": start_time,
-                "stop_time": stop_time,
-            }
-        )
+        out.append({"start_date": s_date, "end_date": e_date, "start_time": start_time, "stop_time": stop_time})
 
     # de-dupe
     seen = set()
@@ -319,7 +325,9 @@ def _extract_occurrences(detail: Dict[str, Any], max_span_days: int) -> List[Dic
             continue
         seen.add(k)
         uniq.append(o)
+
     return uniq
+
 
 def _extract_canceled(event_data: Dict[str, Any]) -> bool:
     meta = event_data.get("meta", {})
@@ -329,6 +337,7 @@ def _extract_canceled(event_data: Dict[str, Any]) -> bool:
     if not status:
         status = str(event_data.get("event_status") or "").strip()
     return "cancel" in status.lower()
+
 
 def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_days: int, debug: bool) -> List[Dict[str, str]]:
     data = detail.get("data", {})
@@ -390,7 +399,7 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
         _set_by_alias(row, hmap, ["vision"], _yn(svc["vision"]))
         _set_by_alias(row, hmap, ["dentures"], _yn(svc["dentures"]))
 
-        # safety for slight header variants
+        # extra safety for slight header variants
         for col, val in [
             (_find_header_contains(header, "start", "date"), occ["start_date"]),
             (_find_header_contains(header, "end", "date"), occ["end_date"]),
@@ -404,16 +413,18 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
 
     return rows
 
-def _sort_key(row: Dict[str, str]) -> Tuple[int, str, str]:
-    # old sheet uses M/D/YYYY; sort lexically is wrong -> parse it
-    s = (row.get("start_date") or "").strip()
-    if not s:
-        return (1, "9999-12-31", (row.get("title") or "").lower())
-    try:
-        d = datetime.strptime(s, "%m/%d/%Y").date()
-        return (0, d.isoformat(), (row.get("title") or "").lower())
-    except Exception:
-        return (0, s, (row.get("title") or "").lower())
+
+def _extract_event_ids(list_payload: Any) -> List[int]:
+    items = _flatten_events_payload(list_payload)
+    ids: List[int] = []
+    for it in items:
+        if not _looks_like_event(it):
+            continue
+        eid = _extract_event_id(it)
+        if eid is not None:
+            ids.append(eid)
+    return sorted(set(ids))
+
 
 def main() -> None:
     base_url = os.environ.get("MEC_BASE_URL", "").strip()
@@ -426,74 +437,95 @@ def main() -> None:
     max_pages = int((os.environ.get("MAX_PAGES", "50") or "50").strip())
     max_span_days = int((os.environ.get("MAX_SPAN_DAYS", "10") or "10").strip())
     debug = (os.environ.get("MEC_DEBUG", "") or "").strip().lower() in {"1", "true", "yes", "y"}
-    forced_delim = (os.environ.get("CSV_DELIMITER", "auto") or "auto").strip().lower()
+
+    delimiter = _csv_delimiter_from_env()
+    delim_label = "TAB" if delimiter == "\t" else "COMMA"
 
     if not base_url or not token or not csv_path:
         raise SystemExit("Missing env vars. Need MEC_BASE_URL, MEC_TOKEN, CSV_PATH.")
 
-    header, delim = _detect_existing_format(csv_path, forced_delim)
     if debug:
         print(f"[cfg] base_url={base_url}")
         print(f"[cfg] start={start} end={end} limit={limit} max_pages={max_pages} max_span_days={max_span_days}")
-        print(f"[cfg] csv_path={csv_path} delimiter={'TAB' if delim == chr(9) else 'COMMA'} (forced={forced_delim})")
+        print(f"[cfg] csv_path={csv_path} delimiter={delim_label}")
 
-    # If the file doesn't exist yet, use a safe default header (but your existing header will be preserved when present)
+    header = _read_existing_header(csv_path, delimiter=delimiter)
     if not header:
         header = [
-            "canceled","lat","lng","address","city","state","title","facility","telehealth",
+            "canceled","lat","lng","address","city","state","site","facility","telehealth",
             "start_time","stop_time","start_date","end_date","parking_date","parking_time",
             "medical","dental","vision","dentures","url",
         ]
 
-    # --- list events with best-effort paging ---
     base_params = {"start": start, "end": end, "limit": limit}
 
-    ids: Set[int] = set()
-
-    # page 1
+    # Page 1
     payload = _mec_get(base_url, token, "events", params=base_params, debug=debug)
-    page_ids = _extract_event_ids(payload)
-    ids.update(page_ids)
+    all_ids = set(_extract_event_ids(payload))
     if debug:
-        print(f"[mec] page=1 extracted unique IDs: {len(page_ids)} (total unique now {len(ids)})")
+        print(f"[mec] page=1 extracted unique IDs: {len(all_ids)}")
 
-    # try pages 2..N
+    # Best-effort paging (many MEC installs ignore page params; harmless to try)
     for page in range(2, max_pages + 1):
         p = dict(base_params)
         p["page"] = str(page)
         payload = _mec_get(base_url, token, "events", params=p, debug=debug)
-        new_ids = _extract_event_ids(payload)
-        before = len(ids)
-        ids.update(new_ids)
+        ids = set(_extract_event_ids(payload))
+        before = len(all_ids)
+        all_ids |= ids
         if debug:
-            print(f"[mec] page={page} extracted unique IDs: {len(new_ids)} (total unique now {len(ids)})")
-        # stop if nothing new (paging ignored or end reached)
-        if len(ids) == before:
+            print(f"[mec] page={page} -> extracted {len(ids)} IDs (total unique now {len(all_ids)})")
+        # If adding pages doesn't increase IDs, paging is probably ignored
+        if len(all_ids) == before:
             break
 
-    event_ids = sorted(ids)
+    event_ids = sorted(all_ids)
     if not event_ids:
         raise SystemExit("No events returned from MEC /events endpoint. Check token + endpoint + date params.")
 
     if debug:
         print(f"[mec] Total unique event IDs: {len(event_ids)}")
 
-    # --- build rows ---
     all_rows: List[Dict[str, str]] = []
+    skipped_404 = 0
+    skipped_other = 0
+
     for eid in event_ids:
-        detail = _mec_get(base_url, token, f"events/{eid}", params=base_params, debug=debug)
+        try:
+            detail = _mec_get(base_url, token, f"events/{eid}", params=None, debug=debug)
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 404:
+                skipped_404 += 1
+                if debug:
+                    print(f"[skip] events/{eid} -> 404")
+                continue
+            skipped_other += 1
+            if debug:
+                print(f"[skip] events/{eid} -> HTTP {status}")
+            continue
+        except Exception:
+            skipped_other += 1
+            if debug:
+                print(f"[skip] events/{eid} -> exception")
+            continue
+
         all_rows.extend(_build_rows_for_event(detail, header, max_span_days=max_span_days, debug=debug))
 
-    # sort for sanity (helps you eyeball missing stuff)
+    # Optional: sort by start_date for nicer diffs/readability
+    def _sort_key(row: Dict[str, str]):
+        s = (row.get("start_date") or "").strip()
+        return (s == "", s, (row.get("title") or "").lower())
+
     all_rows.sort(key=_sort_key)
 
-    # --- write preserving delimiter ---
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore", delimiter=delim)
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore", delimiter=delimiter)
         w.writeheader()
         w.writerows(all_rows)
 
-    print(f"Wrote {len(all_rows)} rows to {csv_path}")
+    print(f"Wrote {len(all_rows)} rows to {csv_path} (skipped 404={skipped_404}, skipped_other={skipped_other})")
+
 
 if __name__ == "__main__":
     main()
