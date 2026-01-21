@@ -9,12 +9,11 @@ Required env vars:
 - CSV_PATH: output CSV filename in repo, e.g. "Clinic Master Schedule for git.csv"
 
 Optional env vars:
-- MEC_START: YYYY-MM-DD (default: 2025-01-01)  # IMPORTANT: include series that started earlier
-- MEC_END:   YYYY-MM-DD (default: 2027-12-31)
+- MEC_START: YYYY-MM-DD (default: 2010-01-01)
+- MEC_END:   YYYY-MM-DD (default: 2030-12-31)
 - MEC_LIMIT: int (default: 200)
-- MAX_SPAN_DAYS: int (default: 10)   # skips suspiciously long occurrences from repeat rules
-- MEC_WINDOW_DAYS: int (default: 31) # queries MEC in smaller date windows to avoid missing/500s
-- MEC_PAGE_MAX: int (default: 20)    # tries paging if supported (safe if ignored)
+- MAX_PAGES: int (default: 50)   # defensive paging attempt on /events list endpoint
+- MAX_SPAN_DAYS: int (default: 10)  # skips suspiciously long occurrences from repeat rules
 - MEC_DEBUG: "1" to print diagnostics
 """
 
@@ -23,14 +22,12 @@ from __future__ import annotations
 import csv
 import os
 import re
-import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 
-# -------------------- Helpers --------------------
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
@@ -86,47 +83,19 @@ def _yn(b: bool) -> str:
     return "Yes" if b else "No"
 
 
-def _parse_ymd(s: str) -> Optional[date]:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-
-def _daterange_windows(start_s: str, end_s: str, window_days: int) -> List[Tuple[str, str]]:
-    sd = _parse_ymd(start_s)
-    ed = _parse_ymd(end_s)
-    if not sd or not ed:
-        raise SystemExit("MEC_START and MEC_END must be YYYY-MM-DD")
-
-    windows: List[Tuple[str, str]] = []
-    cur = sd
-    while cur <= ed:
-        w_end = min(ed, cur + timedelta(days=window_days - 1))
-        windows.append((cur.isoformat(), w_end.isoformat()))
-        cur = w_end + timedelta(days=1)
-    return windows
-
-
-# -------------------- MEC HTTP --------------------
-def _mec_get(session: requests.Session, base_url: str, token: str, path: str, params: Optional[dict] = None) -> Any:
+def _mec_get(session: requests.Session, base_url: str, token: str, path: str, params: Optional[dict] = None, debug: bool = False) -> Any:
     url = base_url.rstrip("/") + "/" + path.lstrip("/")
-    headers = {"mec-token": token}
-
-    # retry/backoff for common transient failures
-    backoff = 1.5
-    for attempt in range(1, 7):
-        try:
-            r = session.get(url, headers=headers, params=params, timeout=60)
-            if r.status_code in (500, 502, 503, 504, 429):
-                raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            if attempt == 6:
-                raise
-            time.sleep(backoff)
-            backoff *= 1.8
+    r = session.get(url, headers={"mec-token": token}, params=params, timeout=60)
+    if debug:
+        print(f"[mec] GET {r.url} -> {r.status_code}")
+    try:
+        r.raise_for_status()
+    except Exception:
+        # print a short snippet to help diagnose 500/401 responses
+        snippet = (r.text or "")[:500]
+        print(f"[mec] ERROR body (first 500 chars): {snippet}")
+        raise
+    return r.json()
 
 
 def _flatten_events_payload(payload: Any) -> List[Dict[str, Any]]:
@@ -174,113 +143,105 @@ def _extract_event_ids(list_payload: Any) -> List[int]:
     return sorted(set(ids))
 
 
-def _collect_event_ids(
+def _fetch_all_event_ids(
     session: requests.Session,
     base_url: str,
     token: str,
     start: str,
     end: str,
-    limit: str,
-    window_days: int,
-    page_max: int,
+    limit: int,
+    max_pages: int,
     debug: bool,
 ) -> List[int]:
-    all_ids: set[int] = set()
+    """
+    Defensive approach:
+    - Call /events with given start/end/limit
+    - Also try paging using page=, paged=, offset=
+      (some MEC installs implement one of these, some ignore them).
+    - Stop when IDs stop changing or we get empty results.
+    """
+    base_params = {"start": start, "end": end, "limit": str(limit)}
 
-    windows = _daterange_windows(start, end, window_days)
+    # First request (no paging)
+    first = _mec_get(session, base_url, token, "events", params=base_params, debug=debug)
+    ids0 = _extract_event_ids(first)
     if debug:
-        print(f"[info] Querying MEC in {len(windows)} windows of ~{window_days} days")
+        print(f"[mec] IDs (no paging): {len(ids0)}")
 
-    for (w_start, w_end) in windows:
-        # Try paging if MEC supports it. If ignored, it’s harmless.
-        window_ids: set[int] = set()
-        for page in range(1, page_max + 1):
-            params = {"start": w_start, "end": w_end, "limit": limit, "page": str(page)}
-            payload = _mec_get(session, base_url, token, "events", params=params)
+    all_ids = set(ids0)
+
+    # Try common paging styles
+    paging_styles: List[Tuple[str, int]] = [
+        ("page", 2),
+        ("paged", 2),
+        ("offset", limit),  # offset increments by limit
+    ]
+
+    for style, start_val in paging_styles:
+        if debug:
+            print(f"[mec] Trying paging style: {style}")
+        prev_snapshot = sorted(all_ids)
+
+        val = start_val
+        for i in range(2, max_pages + 1):
+            params = dict(base_params)
+
+            if style in ("page", "paged"):
+                params[style] = str(i)
+            else:  # offset
+                params[style] = str(val)
+                val += limit
+
+            payload = _mec_get(session, base_url, token, "events", params=params, debug=debug)
             ids = _extract_event_ids(payload)
-
             if debug:
-                print(f"[debug] window {w_start}..{w_end} page={page} ids={len(ids)}")
+                print(f"[mec] {style}={params[style]} -> {len(ids)} IDs")
 
-            new = 0
-            for i in ids:
-                if i not in window_ids:
-                    window_ids.add(i)
-                    new += 1
-
-            # stop paging if nothing new appears
-            if not ids or new == 0:
+            if not ids:
                 break
 
-        all_ids |= window_ids
+            before = len(all_ids)
+            all_ids.update(ids)
+
+            # If this paging param is ignored, results won't change; bail quickly
+            if len(all_ids) == before and sorted(all_ids) == prev_snapshot:
+                # no new IDs; assume paging param not supported or no more pages
+                break
+
+            prev_snapshot = sorted(all_ids)
 
     return sorted(all_ids)
 
 
-# -------------------- Event parsing --------------------
-def _pick_location_from_locations(locations: Any, wanted_id: Optional[str]) -> Dict[str, Any]:
-    """
-    MEC detail often provides locations as dict keyed by location_id -> {name,address,latitude,...}
-    We try:
-      1) exact match to wanted_id
-      2) first "best" (has lat/lng or address)
-      3) first dict value
-    """
-    if not isinstance(locations, dict) or not locations:
-        return {}
-
-    if wanted_id:
-        # sometimes ids are ints/strings
-        for k, v in locations.items():
-            if str(k) == str(wanted_id) and isinstance(v, dict):
-                return v
-
-    # pick best filled
-    best: Dict[str, Any] = {}
-    for v in locations.values():
-        if not isinstance(v, dict):
-            continue
-        lat = str(v.get("latitude", "")).strip()
-        lng = str(v.get("longitude", "")).strip()
-        addr = str(v.get("address", "")).strip()
-        if lat and lng:
-            return v
-        if addr and not best:
-            best = v
-
-    if best:
-        return best
-
-    # fallback: first dict value
-    for v in locations.values():
-        if isinstance(v, dict):
-            return v
-    return {}
+def _pick_first_dict_value(d: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(d, dict) or not d:
+        return None
+    first_key = sorted(d.keys(), key=lambda x: str(x))[0]
+    v = d.get(first_key)
+    return v if isinstance(v, dict) else None
 
 
 def _extract_location(event_data: Dict[str, Any]) -> Dict[str, str]:
-    locations = event_data.get("locations", {})
+    # Common MEC structure: locations is a dict-of-dicts
+    loc = _pick_first_dict_value(event_data.get("locations", {})) or {}
 
-    # try to find a referenced location id
-    wanted_id = None
-    for key in ("location_id", "location", "mec_location_id"):
-        v = event_data.get(key)
-        if isinstance(v, (int, str)) and str(v).strip():
-            wanted_id = str(v).strip()
-            break
-        if isinstance(v, dict) and v.get("id"):
-            wanted_id = str(v.get("id")).strip()
-            break
-
-    loc = _pick_location_from_locations(locations, wanted_id)
+    # Fallbacks some installs expose:
+    # - event_data["location"] or event_data["data"]["location"] etc.
+    # We'll try to be resilient.
+    def pick(*keys: str) -> str:
+        for k in keys:
+            v = loc.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return ""
 
     return {
         "facility": str(loc.get("name", "")).strip(),
         "address": str(loc.get("address", "")).strip(),
         "city": str(loc.get("city", "")).strip(),
         "state": str(loc.get("state", "")).strip(),
-        "lat": str(loc.get("latitude", "")).strip(),
-        "lng": str(loc.get("longitude", "")).strip(),
+        "lat": pick("latitude", "lat"),
+        "lng": pick("longitude", "lng", "lon"),
     }
 
 
@@ -329,6 +290,13 @@ def _clinic_type_flags(clinic_type_value: str, fallback_text: str) -> Dict[str, 
         return w.lower() in src.lower()
 
     return {"telehealth": has("telehealth"), "popup": has("popup")}
+
+
+def _parse_ymd(s: str) -> Optional[date]:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
 
 
 def _format_time(hour: Any, minutes: Any, ampm: Any) -> str:
@@ -502,18 +470,16 @@ def _build_rows_for_event(detail: Dict[str, Any], header: List[str], max_span_da
     return rows
 
 
-# -------------------- Main --------------------
 def main() -> None:
     base_url = os.environ.get("MEC_BASE_URL", "").strip()
     token = os.environ.get("MEC_TOKEN", "").strip()
     csv_path = os.environ.get("CSV_PATH", "").strip()
 
-    start = os.environ.get("MEC_START", "2025-01-01").strip()
-    end = os.environ.get("MEC_END", "2027-12-31").strip()
-    limit = os.environ.get("MEC_LIMIT", "200").strip()
-    max_span_days = int(os.environ.get("MAX_SPAN_DAYS", "10").strip() or "10")
-    window_days = int(os.environ.get("MEC_WINDOW_DAYS", "31").strip() or "31")
-    page_max = int(os.environ.get("MEC_PAGE_MAX", "20").strip() or "20")
+    start = os.environ.get("MEC_START", "2010-01-01").strip()
+    end = os.environ.get("MEC_END", "2030-12-31").strip()
+    limit = int((os.environ.get("MEC_LIMIT", "200").strip() or "200"))
+    max_pages = int((os.environ.get("MAX_PAGES", "50").strip() or "50"))
+    max_span_days = int((os.environ.get("MAX_SPAN_DAYS", "10").strip() or "10"))
     debug = os.environ.get("MEC_DEBUG", "").strip().lower() in {"1", "true", "yes", "y"}
 
     if not base_url or not token or not csv_path:
@@ -544,20 +510,19 @@ def main() -> None:
             "url",
         ]
 
-    if debug:
-        print(f"[info] MEC_BASE_URL={base_url}")
-        print(f"[info] Range {start}..{end} limit={limit} window_days={window_days} page_max={page_max}")
-
     with requests.Session() as session:
-        event_ids = _collect_event_ids(
+        if debug:
+            print(f"[cfg] base_url={base_url}")
+            print(f"[cfg] start={start} end={end} limit={limit} max_pages={max_pages}")
+
+        event_ids = _fetch_all_event_ids(
             session=session,
             base_url=base_url,
             token=token,
             start=start,
             end=end,
             limit=limit,
-            window_days=window_days,
-            page_max=page_max,
+            max_pages=max_pages,
             debug=debug,
         )
 
@@ -565,13 +530,11 @@ def main() -> None:
             raise SystemExit("No events returned from MEC /events endpoint. Try widening MEC_START/MEC_END.")
 
         if debug:
-            print(f"[info] Found {len(event_ids)} unique event IDs")
+            print(f"[mec] Total unique event IDs: {len(event_ids)}")
 
         all_rows: List[Dict[str, str]] = []
-        for i, eid in enumerate(event_ids, start=1):
-            if debug and i % 25 == 0:
-                print(f"[debug] fetching details {i}/{len(event_ids)}...")
-            detail = _mec_get(session, base_url, token, f"events/{eid}")
+        for eid in event_ids:
+            detail = _mec_get(session, base_url, token, f"events/{eid}", debug=debug)
             all_rows.extend(_build_rows_for_event(detail, header, max_span_days=max_span_days, debug=debug))
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
