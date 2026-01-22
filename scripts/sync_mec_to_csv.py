@@ -4,14 +4,13 @@ sync_mec_to_csv.py
 
 Fetch events from a MEC-like API and write a normalized CSV.
 
-Key rule implemented:
-  - If an event is marked "All-day", the CSV start_time/end_time are blank
-    (even if some schedule/hourly field contains 8:00 AM - 6:00 PM).
+Rule:
+  - If an event is marked "All-day", the CSV start_time/end_time are blank.
 
-Env vars (matches your pipeline logs):
-  MEC_BASE_URL   (required) e.g. https://example.com/wp-json/mec/v1
-  MEC_TOKEN      (optional) auth token
-  CSV_PATH       (required) output csv path
+Env vars:
+  MEC_BASE_URL   (required)
+  MEC_TOKEN      (optional)
+  CSV_PATH       (required)
   MEC_START      default: 2010-01-01
   MEC_END        default: 2030-12-31
   MEC_LIMIT      default: 200
@@ -26,7 +25,6 @@ from __future__ import annotations
 
 import csv
 import os
-import sys
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -48,12 +46,11 @@ def env(name: str, default: Optional[str] = None) -> str:
 def to_bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
 def debug_enabled() -> bool:
     return to_bool(os.getenv("MEC_DEBUG", "0"))
 
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 def delimiter_from_env(v: str) -> str:
     m = v.strip().lower()
@@ -73,14 +70,12 @@ def delimiter_from_env(v: str) -> str:
 # ----------------------------
 
 def parse_iso_date(s: str) -> date:
-    # expects YYYY-MM-DD
     return datetime.strptime(s.strip(), "%Y-%m-%d").date()
 
 def parse_any_date(s: str) -> Optional[date]:
     if not s:
         return None
     s = s.strip()
-    # common: YYYY-MM-DD
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -92,28 +87,24 @@ def format_date(d: date, mode: str) -> str:
     if mode == "ymd":
         return d.strftime("%Y-%m-%d")
     if mode == "mdy":
-        # m/d/YYYY (no leading zeros like your sample)
         return f"{d.month}/{d.day}/{d.year}"
     raise SystemExit(f"Unknown DATE_FORMAT: {mode}")
 
 def normalize_time_str(s: str) -> str:
-    """
-    Return something like '8:00 AM' from many inputs.
-    If we can't parse, return original trimmed.
-    """
     if not s:
         return ""
     s = s.strip()
-    # Already looks like "8:00 AM"
     if re.search(r"\b(AM|PM)\b", s, flags=re.IGNORECASE):
-        # normalize AM/PM capitalization
         s = re.sub(r"\b(am|pm)\b", lambda m: m.group(1).upper(), s, flags=re.IGNORECASE)
         return s
-    # Try 24h like "08:00"
     for fmt in ("%H:%M", "%H:%M:%S"):
         try:
             t = datetime.strptime(s, fmt).time()
-            return datetime.strptime(t.strftime("%H:%M"), "%H:%M").strftime("%-I:%M %p")
+            # %-I may not work on Windows; keep it safe:
+            hour = int(t.strftime("%I"))
+            minute = t.strftime("%M")
+            ampm = t.strftime("%p")
+            return f"{hour}:{minute} {ampm}"
         except Exception:
             pass
     return s
@@ -139,13 +130,55 @@ class Cfg:
     include_ongoing: bool = True
 
 
+def _looks_like_event_list(x: Any) -> bool:
+    if not isinstance(x, list) or not x:
+        return False
+    if not isinstance(x[0], dict):
+        return False
+    # Many event items include one of these
+    keys = set(x[0].keys())
+    return bool(keys.intersection({"id", "ID", "event_id", "title", "start_date", "date_start"}))
+
+def _find_event_list_anywhere(obj: Any, max_depth: int = 6) -> Optional[List[Dict[str, Any]]]:
+    """
+    Recursively search for a list of dicts that looks like an event list.
+    This fixes the '200 but items=0' case when payload is nested.
+    """
+    if max_depth < 0:
+        return None
+
+    if _looks_like_event_list(obj):
+        return obj  # type: ignore[return-value]
+
+    if isinstance(obj, dict):
+        # common containers first
+        for k in ("events", "items", "data", "results", "posts"):
+            if k in obj:
+                found = _find_event_list_anywhere(obj[k], max_depth=max_depth - 1)
+                if found is not None:
+                    return found
+
+        # otherwise scan all values
+        for v in obj.values():
+            found = _find_event_list_anywhere(v, max_depth=max_depth - 1)
+            if found is not None:
+                return found
+
+    if isinstance(obj, list):
+        for v in obj:
+            found = _find_event_list_anywhere(v, max_depth=max_depth - 1)
+            if found is not None:
+                return found
+
+    return None
+
+
 class MecClient:
     def __init__(self, cfg: Cfg):
         self.cfg = cfg
         self.sess = requests.Session()
         self.sess.headers.update({"Accept": "application/json"})
         if cfg.token:
-            # adjust if your API uses different auth scheme
             self.sess.headers.update({"Authorization": f"Bearer {cfg.token}"})
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
@@ -154,7 +187,6 @@ class MecClient:
         if debug_enabled():
             q = ""
             if params:
-                # don't print token
                 q = "?" + "&".join([f"{k}={params[k]}" for k in params])
             log(f"[mec] GET {url}{q} -> {r.status_code}")
         r.raise_for_status()
@@ -169,20 +201,25 @@ class MecClient:
             "offset": offset,
         }
         data = self._get("/events", params=params)
-        # Some APIs return {"data": [...]} or {"events": [...]}.
-        if isinstance(data, list):
-            return data
-        for key in ("data", "events", "items"):
-            if key in data and isinstance(data[key], list):
-                return data[key]
-        return []
+
+        found = _find_event_list_anywhere(data)
+        if found is None:
+            if debug_enabled():
+                if isinstance(data, dict):
+                    log(f"[mec] Could not locate event list in response. Top-level keys: {list(data.keys())}")
+                else:
+                    log(f"[mec] Could not locate event list in response. Type: {type(data)}")
+            return []
+
+        return found
 
     def get_event(self, event_id: int) -> Dict[str, Any]:
         data = self._get(f"/events/{event_id}")
-        # Some APIs return {"data": {...}}
-        if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
-            return data["data"]
-        return data
+        # common wrappers
+        if isinstance(data, dict):
+            if "data" in data and isinstance(data["data"], dict):
+                return data["data"]
+        return data if isinstance(data, dict) else {}
 
 
 # ----------------------------
@@ -212,13 +249,6 @@ def str_or_empty(v: Any) -> str:
     return str(v).strip()
 
 def parse_services(event: Dict[str, Any]) -> Tuple[str, str, str, str]:
-    """
-    Return medical,dental,vision,dentures as 'Yes'/'No'.
-    Try:
-      - event['services'] string/list
-      - event['services_field']
-      - fallback: taxonomy/title text search (best-effort)
-    """
     raw = first_non_empty(
         event.get("services"),
         event.get("services_field"),
@@ -232,7 +262,6 @@ def parse_services(event: Dict[str, Any]) -> Tuple[str, str, str, str]:
     else:
         text = str(raw) if raw is not None else ""
 
-    # fallback: use taxonomy/title
     if not text.strip():
         text = " ".join([
             str_or_empty(event.get("title")),
@@ -249,11 +278,6 @@ def parse_services(event: Dict[str, Any]) -> Tuple[str, str, str, str]:
     return medical, dental, vision, dentures
 
 def extract_location(event: Dict[str, Any]) -> Tuple[str, str, str, str, str, str, str, str]:
-    """
-    Return: lat,lng,address,city,state,site,facility,telehealth(Yes/No)
-    Best-effort across common MEC shapes.
-    """
-    # venue may be under event['venue'] or event['location'] or event['meta']['venue']
     venue = first_non_empty(
         event.get("venue"),
         event.get("location"),
@@ -276,11 +300,9 @@ def extract_location(event: Dict[str, Any]) -> Tuple[str, str, str, str, str, st
     city = first_non_empty(event.get("city"), venue.get("city"), get_nested(event, "meta", "city"))
     state = first_non_empty(event.get("state"), venue.get("state"), get_nested(event, "meta", "state"))
 
-    # Your CSV has both "site" and "facility"
-    site = first_non_empty(event.get("site"), venue.get("site"), city and state and f"{city}, {state}")
+    site = first_non_empty(event.get("site"), venue.get("site"), (f"{city}, {state}" if city and state else ""))
     facility = first_non_empty(event.get("facility"), venue.get("name"), event.get("venue_name"), event.get("title"))
 
-    # Telehealth flag: try multiple shapes
     tel = first_non_empty(
         event.get("telehealth"),
         get_nested(event, "meta", "telehealth"),
@@ -304,18 +326,15 @@ def extract_url(event: Dict[str, Any]) -> str:
     return str_or_empty(first_non_empty(event.get("url"), event.get("permalink"), get_nested(event, "meta", "url")))
 
 def extract_canceled(event: Dict[str, Any]) -> str:
-    # MEC might have status like "canceled"/"cancelled" or event_status
     status = str_or_empty(first_non_empty(event.get("status"), event.get("event_status"), get_nested(event, "meta", "status"))).lower()
     if "cancel" in status:
         return "Yes"
-    # Some systems have boolean canceled
     c = first_non_empty(event.get("canceled"), event.get("cancelled"), get_nested(event, "meta", "canceled"))
     if c is True or (isinstance(c, str) and c.strip().lower() in ("1","yes","true","on")):
         return "Yes"
     return "No"
 
 def extract_parking(event: Dict[str, Any]) -> Tuple[str, str]:
-    # you had parking_date + parking_time in your CSV
     pd = first_non_empty(event.get("parking_date"), get_nested(event, "meta", "parking_date"))
     pt = first_non_empty(event.get("parking_time"), get_nested(event, "meta", "parking_time"))
     return str_or_empty(pd), str_or_empty(pt)
@@ -326,16 +345,10 @@ def extract_parking(event: Dict[str, Any]) -> Tuple[str, str]:
 # ----------------------------
 
 def is_all_day(event: Dict[str, Any]) -> bool:
-    """
-    Detect MEC "All-day Event" flag.
-    Adjust this if your payload uses a different key.
-    """
-    # direct flags
     for k in ("all_day", "allDay", "allday"):
         if event.get(k) is True:
             return True
 
-    # meta flags
     meta = first_non_empty(event.get("meta"), event.get("mec"), {}) or {}
     if isinstance(meta, dict):
         for k in ("all_day", "allDay", "allday", "mec_allday", "mec_all_day"):
@@ -348,15 +361,6 @@ def is_all_day(event: Dict[str, Any]) -> bool:
     return False
 
 def extract_times(event: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Extract start_time/end_time for non-all-day events.
-    For all-day events, caller will blank these out.
-
-    We try:
-      - event['start_time'], event['end_time']
-      - meta fields
-      - schedule strings
-    """
     st = first_non_empty(
         event.get("start_time"),
         get_nested(event, "meta", "start_time"),
@@ -368,7 +372,6 @@ def extract_times(event: Dict[str, Any]) -> Tuple[str, str]:
         get_nested(event, "mec", "end_time"),
     )
 
-    # Some APIs store "time" like "8:00 AM - 6:00 PM"
     if not st or not et:
         sched = first_non_empty(
             event.get("time"),
@@ -388,24 +391,14 @@ def extract_times(event: Dict[str, Any]) -> Tuple[str, str]:
 # ----------------------------
 
 def extract_event_dates(event: Dict[str, Any]) -> Tuple[Optional[date], Optional[date]]:
-    """
-    Pull start/end date of the event (not per-occurrence).
-    """
     sd = first_non_empty(event.get("start_date"), get_nested(event, "meta", "start_date"), event.get("date_start"))
     ed = first_non_empty(event.get("end_date"), get_nested(event, "meta", "end_date"), event.get("date_end"))
 
     d1 = parse_any_date(str_or_empty(sd))
     d2 = parse_any_date(str_or_empty(ed))
-
     return d1, d2
 
 def extract_occurrence_dates(event: Dict[str, Any]) -> List[Tuple[date, date]]:
-    """
-    Return list of (start_date, end_date) for occurrences.
-    Many MEC payloads include an 'occurrences' list; otherwise we fallback to event dates.
-
-    Also clamps overly-long spans with MAX_SPAN_DAYS (protects runaways).
-    """
     occ = first_non_empty(event.get("occurrences"), get_nested(event, "meta", "occurrences"))
     out: List[Tuple[date, date]] = []
 
@@ -431,15 +424,11 @@ def extract_occurrence_dates(event: Dict[str, Any]) -> List[Tuple[date, date]]:
 
 def daterange(d1: date, d2: date) -> Iterable[date]:
     cur = d1
-    step = timedelta(days=1)
     while cur <= d2:
         yield cur
-        cur += step
+        cur += timedelta(days=1)
 
 def expand_to_rows(event: Dict[str, Any], cfg: Cfg) -> List[Dict[str, str]]:
-    """
-    Expand an event into daily rows across each (occurrence) date span, then we'll clean.
-    """
     canceled = extract_canceled(event)
     lat, lng, address, city, state, site, facility, telehealth = extract_location(event)
     url = extract_url(event)
@@ -449,23 +438,20 @@ def expand_to_rows(event: Dict[str, Any], cfg: Cfg) -> List[Dict[str, str]]:
     all_day = is_all_day(event)
     start_time, end_time = extract_times(event)
 
-    # THE RULE: if all-day, blank times
+    # RULE: all-day => blank times
     if all_day:
         start_time = ""
         end_time = ""
 
     rows: List[Dict[str, str]] = []
-
     for (sd, ed) in extract_occurrence_dates(event):
-        # Clamp spans
         if (ed - sd).days > cfg.max_span_days:
             if debug_enabled():
                 log(f"[warn] span too long ({sd} -> {ed}), clamping to {cfg.max_span_days} days for url={url}")
             ed = sd + timedelta(days=cfg.max_span_days)
 
-        # Create one row per day in the span
         for d in daterange(sd, ed):
-            row = {
+            rows.append({
                 "canceled": canceled,
                 "lat": lat,
                 "lng": lng,
@@ -479,32 +465,22 @@ def expand_to_rows(event: Dict[str, Any], cfg: Cfg) -> List[Dict[str, str]]:
                 "end_time": end_time,
                 "start_date": format_date(d, cfg.date_format),
                 "end_date": format_date(d, cfg.date_format),
-                "parking_date": str_or_empty(parking_date),
-                "parking_time": str_or_empty(parking_time),
+                "parking_date": parking_date,
+                "parking_time": parking_time,
                 "medical": medical,
                 "dental": dental,
                 "vision": vision,
                 "dentures": dentures,
                 "url": url,
-                # internal (not written): helps ensure all-day override survives later
                 "_all_day": "1" if all_day else "0",
-            }
-            rows.append(row)
+            })
 
     return rows
 
 def drop_range_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Your newer output indicates you prefer ONE row for multi-day pop-up clinics.
-    This function keeps the LAST day only for any multi-day span within the same event URL.
-
-    For telehealth single-day repeating, this doesn't change anything because each span is one day.
-    """
     if not rows:
         return rows
 
-    # group by url + contiguous spans (we only know dates, so simplest is group by url)
-    # Keep only the maximum date per url if more than one date exists.
     by_url: Dict[str, List[Dict[str, str]]] = {}
     for r in rows:
         by_url.setdefault(r.get("url", ""), []).append(r)
@@ -514,22 +490,17 @@ def drop_range_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if len(group) == 1:
             out.append(group[0])
             continue
-        # pick the one with latest start_date
+
         def keyfunc(rr: Dict[str, str]) -> Tuple[int, int, int]:
             d = parse_any_date(rr["start_date"]) or date.min
             return (d.year, d.month, d.day)
-        best = max(group, key=keyfunc)
-        out.append(best)
+
+        out.append(max(group, key=keyfunc))
 
     return out
 
 def collapse_duplicates_by_date(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Collapse exact duplicates that share (url, start_date).
-    Keep the "most complete" row (more filled fields).
-    """
     def score(r: Dict[str, str]) -> int:
-        # count non-empty values excluding internal keys
         return sum(1 for k, v in r.items() if not k.startswith("_") and str(v).strip() != "")
 
     grouped: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
@@ -537,17 +508,11 @@ def collapse_duplicates_by_date(rows: List[Dict[str, str]]) -> List[Dict[str, st
         grouped.setdefault((r.get("url", ""), r.get("start_date", "")), []).append(r)
 
     out: List[Dict[str, str]] = []
-    for _, group in grouped.items():
-        if len(group) == 1:
-            out.append(group[0])
-        else:
-            out.append(max(group, key=score))
+    for group in grouped.values():
+        out.append(max(group, key=score))
     return out
 
 def enforce_all_day_override(rows: List[Dict[str, str]]) -> None:
-    """
-    Critical: run AFTER any dedupe/merge to ensure all-day events always have blank times.
-    """
     for r in rows:
         if r.get("_all_day") == "1":
             r["start_time"] = ""
@@ -559,10 +524,6 @@ def enforce_all_day_override(rows: List[Dict[str, str]]) -> None:
 # ----------------------------
 
 def collect_unique_event_ids(client: MecClient, cfg: Cfg) -> List[int]:
-    """
-    Paginates using (start_date, offset) pattern like your logs.
-    Detects pagination loops (same start_date+offset again).
-    """
     start_date = cfg.start
     offset = 0
     seen_pages = set()
@@ -579,55 +540,41 @@ def collect_unique_event_ids(client: MecClient, cfg: Cfg) -> List[int]:
 
         items = client.list_events_page(start_date=start_date, offset=offset)
 
-        # In your logs you show ids=... hints_added=...
         ids_this_page: List[int] = []
+        max_date: Optional[date] = None
+
         for it in items:
             if not isinstance(it, dict):
                 continue
             eid = it.get("id") or it.get("event_id") or it.get("ID")
             try:
-                eid = int(eid)
+                eid_int = int(eid)
             except Exception:
                 continue
-            ids_this_page.append(eid)
-            if eid not in seen_ids:
-                seen_ids.add(eid)
-                unique_ids.append(eid)
+            ids_this_page.append(eid_int)
+            if eid_int not in seen_ids:
+                seen_ids.add(eid_int)
+                unique_ids.append(eid_int)
+
+            d = parse_any_date(str_or_empty(first_non_empty(it.get("start_date"), it.get("date_start"), get_nested(it, "meta", "start_date"))))
+            if d and (max_date is None or d > max_date):
+                max_date = d
 
         log(f"[mec] list page {page}: start_date={start_date.isoformat()} offset={offset} -> items={len(items)} ids={len(set(ids_this_page))} unique_total={len(unique_ids)}")
 
         if not items:
             break
 
-        # Advance pagination:
-        # If API returns "next" hints, use them; else use heuristic:
-        # move start_date to max end date seen in this page and reset offset to 0.
-        max_date = None
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            d = parse_any_date(str_or_empty(first_non_empty(it.get("start_date"), it.get("date_start"), get_nested(it, "meta", "start_date"))))
-            if d and (max_date is None or d > max_date):
-                max_date = d
-
-        # If we got fewer than limit, we might still need to advance; simplest:
-        # if max_date exists and max_date >= start_date: move start_date to max_date and offset += len(items)
-        if max_date is None:
+        # advance pagination
+        if max_date is None or max_date <= start_date:
             offset += len(items)
         else:
-            # Many APIs expect offset to be within same start_date bucket.
-            # We'll do: if we are still on same start_date, increment offset;
-            # if max_date moved forward, reset offset near 0.
-            if max_date <= start_date:
-                offset += len(items)
-            else:
-                start_date = max_date
-                offset = 0
+            start_date = max_date
+            offset = 0
 
     return unique_ids
 
 def write_csv(path: str, rows: List[Dict[str, str]], delimiter: str) -> None:
-    # Ensure stable column order exactly like your header
     fieldnames = [
         "canceled","lat","lng","address","city","state","site","facility","telehealth",
         "start_time","end_time","start_date","end_date","parking_date","parking_time",
@@ -637,8 +584,7 @@ def write_csv(path: str, rows: List[Dict[str, str]], delimiter: str) -> None:
         w = csv.DictWriter(f, fieldnames=fieldnames, delimiter=delimiter)
         w.writeheader()
         for r in rows:
-            out = {k: r.get(k, "") for k in fieldnames}
-            w.writerow(out)
+            w.writerow({k: r.get(k, "") for k in fieldnames})
 
 def main() -> int:
     cfg = Cfg(
@@ -657,7 +603,7 @@ def main() -> int:
     log(f"[cfg] base_url={cfg.base_url}")
     log(f"[cfg] start={cfg.start.isoformat()} end={cfg.end.isoformat()} limit={cfg.limit} max_pages={cfg.max_pages} max_span_days={cfg.max_span_days}")
     log(f"[cfg] include_past={1 if cfg.include_past else 0} include_ongoing={1 if cfg.include_ongoing else 0}")
-    log(f"[cfg] csv_path={cfg.csv_path} delimiter={'COMMA' if cfg.csv_delimiter==',' else cfg.csv_delimiter} date_format={cfg.date_format}")
+    log(f"[cfg] csv_path={cfg.csv_path} delimiter=COMMA date_format={cfg.date_format}")
 
     client = MecClient(cfg)
 
@@ -676,7 +622,6 @@ def main() -> int:
                 continue
             raise
 
-        # Build rows
         rows = expand_to_rows(event, cfg)
 
         before = len(rows)
@@ -689,12 +634,9 @@ def main() -> int:
         if debug_enabled():
             log(f"[clean] collapsed duplicates by date: {before} -> {len(rows)}")
 
-        # Enforce all-day override AFTER any merging
         enforce_all_day_override(rows)
-
         all_rows.extend(rows)
 
-    # Final global collapse (optional but safe)
     all_rows = collapse_duplicates_by_date(all_rows)
     enforce_all_day_override(all_rows)
 
