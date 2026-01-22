@@ -8,10 +8,11 @@ Fixes included in this version:
 - Retries on HTTP 202/429/5xx.
 - Services flags come from custom field "Services"; if missing, falls back to taxonomy/title text.
 - Extracts occurrences robustly:
-    * Builds per-occurrence "hints" from the /events list response (deep-scans each list item for start/end blocks).
+    * Builds per-occurrence hints from the /events list response (deep-scans each list item for start/end blocks).
     * Falls back to scanning the event detail payload for occurrences.
-    * Dedupes occurrences aggressively to prevent the "triplicate rows" problem.
-- Final row-level dedupe (same event/date/time/location) to avoid duplicate clinics in the CSV.
+- **NEW**: Per-event row cleanup to eliminate duplicates and bad "range" rows:
+    * If any single-day rows exist, drop multi-day range rows for that event.
+    * For duplicates on same date(s), keep the row that contains times (prefer timeful over timeless).
 - Writes comma CSV by default (set CSV_DELIMITER=tab for TSV).
 
 Required env vars:
@@ -202,7 +203,7 @@ def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
         {
-            "User-Agent": "ram-mec-sync/2.1",
+            "User-Agent": "ram-mec-sync/2.2",
             "Accept": "application/json,text/plain,*/*",
         }
     )
@@ -262,7 +263,6 @@ def _extract_event_id(item: Dict[str, Any]) -> Optional[int]:
                 return int(item.get(k))
             except Exception:
                 return None
-    # sometimes list items nest the ID under "data"
     d = item.get("data")
     if isinstance(d, dict):
         for k in ("ID", "id", "post_id", "event_id"):
@@ -316,12 +316,6 @@ def _deep_find_label_value_pairs(obj: Any) -> Iterable[Tuple[str, Any]]:
 
 
 def _extract_custom_fields(event_data: Dict[str, Any], whole_detail: Dict[str, Any]) -> Dict[str, str]:
-    """
-    MEC sometimes places custom fields in event_data["fields"], but some events return them elsewhere.
-    We:
-      1) try event_data["fields"]
-      2) deep-scan the whole detail payload for label/value pairs
-    """
     out: Dict[str, str] = {}
 
     def consider(label_raw: str, value_any: Any) -> None:
@@ -420,10 +414,6 @@ _YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _find_occurrence_blocks_anywhere(obj: Any) -> Iterable[Dict[str, Any]]:
-    """
-    Finds dicts shaped like MEC occurrences:
-      { start: {date,hour,minutes,ampm}, end: {...}, allday/hide_time }
-    """
     stack = [obj]
     while stack:
         cur = stack.pop()
@@ -443,10 +433,6 @@ def _find_occurrence_blocks_anywhere(obj: Any) -> Iterable[Dict[str, Any]]:
 
 
 def _extract_occurrences_from_detail(detail: Dict[str, Any], max_span_days: int) -> List[Dict[str, Any]]:
-    """
-    Detail payloads often contain the same occurrence blocks multiple times (e.g., under render/meta/data).
-    We deep-scan but then dedupe hard.
-    """
     occs_raw: List[Dict[str, Any]] = []
 
     for b in _find_occurrence_blocks_anywhere(detail):
@@ -472,8 +458,8 @@ def _extract_occurrences_from_detail(detail: Dict[str, Any], max_span_days: int)
             }
         )
 
-    # Dedupe occurrences
-    seen: Set[Tuple[str, str, str, str, str, str]] = set()
+    # strong dedupe
+    seen: Set[Tuple[str, str, str, str, str, str, str]] = set()
     occs: List[Dict[str, Any]] = []
     for o in occs_raw:
         s = o.get("start") or {}
@@ -484,7 +470,8 @@ def _extract_occurrences_from_detail(detail: Dict[str, Any], max_span_days: int)
             str(s.get("hour") or ""),
             str(s.get("minutes") or ""),
             str(s.get("ampm") or ""),
-            str(e.get("timestamp") or "") or str(s.get("timestamp") or ""),
+            str(e.get("hour") or ""),
+            str(e.get("minutes") or ""),
         )
         if key in seen:
             continue
@@ -495,22 +482,16 @@ def _extract_occurrences_from_detail(detail: Dict[str, Any], max_span_days: int)
 
 
 def _extract_occ_hint_from_list_item(item: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    IMPORTANT: The MEC /events list can include per-occurrence info, but not always at top-level.
-    We return *all* occurrence-shaped blocks we can find in this list item, then dedupe them.
-    """
     hints: List[Dict[str, Any]] = []
 
-    # 1) If top-level start/end exist, capture that
+    # 1) top-level start/end
     if isinstance(item.get("start"), dict) and isinstance(item.get("end"), dict):
         s = item["start"]
         e = item["end"]
         if "date" in s or "date" in e:
-            hints.append(
-                {"start": s, "end": e, "allday": item.get("allday"), "hide_time": item.get("hide_time")}
-            )
+            hints.append({"start": s, "end": e, "allday": item.get("allday"), "hide_time": item.get("hide_time")})
 
-    # 2) Deep scan this list item (some installs nest occurrences under "data" or "dates")
+    # 2) deep scan in item (many installs nest occurrence blocks here)
     for b in _find_occurrence_blocks_anywhere(item):
         s = b.get("start") or {}
         if isinstance(s, dict) and str(s.get("date") or "").strip():
@@ -523,14 +504,14 @@ def _extract_occ_hint_from_list_item(item: Dict[str, Any]) -> List[Dict[str, Any
                 }
             )
 
-    # 3) Common alternates: start_date/end_date fields as YYYY-MM-DD
+    # 3) alternate keys
     for k1, k2 in (("start_date", "end_date"), ("date", "date")):
         sd = _coerce_text(item.get(k1))
         ed = _coerce_text(item.get(k2)) if k2 != k1 else sd
         if _YMD_RE.match(sd):
             hints.append({"start": {"date": sd}, "end": {"date": ed or sd}, "allday": "1", "hide_time": "1"})
 
-    # 4) Timestamp-only variant
+    # 4) timestamp-only variant
     ts = item.get("timestamp")
     if ts is not None:
         try:
@@ -541,8 +522,8 @@ def _extract_occ_hint_from_list_item(item: Dict[str, Any]) -> List[Dict[str, Any
         except Exception:
             pass
 
-    # Dedupe within this list item
-    seen: Set[Tuple[str, str, str, str, str]] = set()
+    # dedupe within item
+    seen: Set[Tuple[str, str, str, str, str, str, str]] = set()
     uniq: List[Dict[str, Any]] = []
     for h in hints:
         s = h.get("start") or {}
@@ -553,6 +534,8 @@ def _extract_occ_hint_from_list_item(item: Dict[str, Any]) -> List[Dict[str, Any
             str(s.get("hour") or ""),
             str(s.get("minutes") or ""),
             str(s.get("ampm") or ""),
+            str(e.get("hour") or ""),
+            str(e.get("minutes") or ""),
         )
         if key in seen:
             continue
@@ -579,7 +562,6 @@ def _occ_to_row_dates_times(occ: Dict[str, Any], cfg: Cfg) -> Dict[str, str]:
         "end_date": _format_date(e_date, cfg.date_format),
         "start_time": start_time,
         "end_time": end_time,
-        # keep raw too (for dedupe keys)
         "_start_ymd": s_date,
         "_end_ymd": e_date,
     }
@@ -597,10 +579,6 @@ def _ymd_in_range(d: str, start: str, end: str) -> bool:
 
 
 def _flatten_all_events_response(payload: Any) -> List[Dict[str, Any]]:
-    """
-    MEC /events returns {success:1, events:{<date>:[...], ...}, pagination:{...}}
-    but some installs differ. This tries to flatten any nested lists of dicts.
-    """
     out: List[Dict[str, Any]] = []
 
     def add_list(lst: Any) -> None:
@@ -623,8 +601,6 @@ def _flatten_all_events_response(payload: Any) -> List[Dict[str, Any]]:
                 for v in ev.values():
                     add_list(v)
                 return out
-
-        # fallback: gather any lists directly under payload
         for v in payload.values():
             add_list(v)
 
@@ -647,12 +623,6 @@ def _fetch_event_detail(cfg: Cfg, sess: requests.Session, eid: int) -> Optional[
 
 
 def _iter_all_occurrences(cfg: Cfg, sess: requests.Session) -> Tuple[Set[int], Dict[int, List[Dict[str, Any]]]]:
-    """
-    Walks /events using official pagination: start_date + offset, and uses pagination.next_date/next_offset.
-    Returns:
-      - unique event ids
-      - occurrence hints per event id (list of occurrence blocks)
-    """
     start_date = cfg.start
     offset = 0
     seen_guard: Set[Tuple[str, int]] = set()
@@ -703,7 +673,6 @@ def _iter_all_occurrences(cfg: Cfg, sess: requests.Session) -> Tuple[Set[int], D
             ids_this.add(eid)
             all_ids.add(eid)
 
-            # Build occurrence hints from the list item itself (this is what fixes missing CareCuts dates)
             hints = _extract_occ_hint_from_list_item(it)
             for h in hints:
                 s_obj = h.get("start") or {}
@@ -735,9 +704,9 @@ def _iter_all_occurrences(cfg: Cfg, sess: requests.Session) -> Tuple[Set[int], D
             break
         start_date = next_date
 
-    # de-dupe occurrence hints per event (common when list items include nested repeat structures)
+    # de-dupe hints per event
     for eid, occs in list(occ_map.items()):
-        seen: Set[Tuple[str, str, str, str, str]] = set()
+        seen: Set[Tuple[str, str, str, str, str, str, str]] = set()
         uniq: List[Dict[str, Any]] = []
         for o in occs:
             s = o.get("start") or {}
@@ -748,6 +717,8 @@ def _iter_all_occurrences(cfg: Cfg, sess: requests.Session) -> Tuple[Set[int], D
                 str(s.get("hour") or ""),
                 str(s.get("minutes") or ""),
                 str(s.get("ampm") or ""),
+                str(e.get("hour") or ""),
+                str(e.get("minutes") or ""),
             )
             if k in seen:
                 continue
@@ -756,6 +727,61 @@ def _iter_all_occurrences(cfg: Cfg, sess: requests.Session) -> Tuple[Set[int], D
         occ_map[eid] = uniq
 
     return all_ids, occ_map
+
+
+def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[str, str]]:
+    """
+    Fixes the exact issues in your CSV:
+
+    1) If the event has ANY single-day rows (start_ymd == end_ymd),
+       drop all multi-day rows for that event. (Removes the unwanted 8/29–8/30 "range row".)
+
+    2) Collapse duplicates for the same date(s):
+       keep the row that has times (prefer timeful over timeless).
+    """
+    if not rows:
+        return rows
+
+    def has_time(r: Dict[str, str]) -> bool:
+        return bool((r.get("start_time") or "").strip() or (r.get("end_time") or "").strip())
+
+    # 1) drop range rows when daily rows exist
+    daily_exists = any((r.get("_start_ymd") or "") and (r.get("_start_ymd") == r.get("_end_ymd")) for r in rows)
+    if daily_exists:
+        before = len(rows)
+        rows = [r for r in rows if (r.get("_start_ymd") == r.get("_end_ymd"))]
+        _debug(cfg, f"[clean] dropped range rows: {before} -> {len(rows)}")
+
+    # 2) collapse timeless duplicates, preferring timeful
+    best: Dict[Tuple[str, str, str, str, str], Dict[str, str]] = {}
+    # key includes url+facility+date(s)+telehealth (some MEC events share url but differ facility rarely)
+    for r in rows:
+        key = (
+            (r.get("url") or "").strip().lower(),
+            (r.get("facility") or "").strip().lower(),
+            (r.get("_start_ymd") or "").strip(),
+            (r.get("_end_ymd") or "").strip(),
+            (r.get("telehealth") or "").strip(),
+        )
+        cur = best.get(key)
+        if cur is None:
+            best[key] = r
+            continue
+        # choose row with times
+        if has_time(r) and not has_time(cur):
+            best[key] = r
+            continue
+        if has_time(r) == has_time(cur):
+            # tie-breaker: keep the one with more filled fields (parking often only on one)
+            score_r = sum(1 for k in ("parking_date", "parking_time") if (r.get(k) or "").strip())
+            score_c = sum(1 for k in ("parking_date", "parking_time") if (cur.get(k) or "").strip())
+            if score_r > score_c:
+                best[key] = r
+
+    out = list(best.values())
+    if cfg.debug:
+        _debug(cfg, f"[clean] collapsed duplicates by date: {len(rows)} -> {len(out)}")
+    return out
 
 
 def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
@@ -778,7 +804,6 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
     url = str(data.get("permalink") or "").strip()
 
     # Occurrences:
-    occs: List[Dict[str, Any]]
     if occ_hints:
         occs = occ_hints
     else:
@@ -822,32 +847,34 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         row["dentures"] = _yn(svc["dentures"])
         row["url"] = url
 
-        # internal fields for dedupe (removed before writing)
+        # internal fields used for cleanup/dedupe
         row["_start_ymd"] = dt["_start_ymd"]
         row["_end_ymd"] = dt["_end_ymd"]
         row["_title"] = title
 
         rows.append(row)
 
+    # **critical cleanup**
+    rows = _postprocess_event_rows(rows, cfg)
+
     return rows
 
 
-def _dedupe_rows(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+def _dedupe_rows_global(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
     """
-    Final safety net: MEC payloads can still lead to duplicates.
-    Dedupe by a stable per-occurrence key.
+    Final safety net across all events.
     """
     seen: Set[Tuple[str, str, str, str, str, str, str]] = set()
     out: List[Dict[str, str]] = []
     for r in rows:
         key = (
             (r.get("url") or "").strip().lower(),
-            (r.get("_title") or "").strip().lower(),
+            (r.get("facility") or "").strip().lower(),
             (r.get("_start_ymd") or r.get("start_date") or "").strip(),
             (r.get("_end_ymd") or r.get("end_date") or "").strip(),
             (r.get("start_time") or "").strip().lower(),
             (r.get("end_time") or "").strip().lower(),
-            (r.get("facility") or "").strip().lower(),
+            (r.get("telehealth") or "").strip().lower(),
         )
         if key in seen:
             continue
@@ -925,11 +952,9 @@ def main() -> None:
 
     sess = _session()
 
-    # 1) Get all events + occurrence hints properly from /events pagination
     event_ids, occ_map = _iter_all_occurrences(cfg, sess)
     _debug(cfg, f"[mec] Total unique event IDs: {len(event_ids)} (with occurrence hints for {len(occ_map)})")
 
-    # 2) Fetch each event detail once, then apply hints to build rows
     all_rows: List[Dict[str, str]] = []
     skipped_404 = 0
 
@@ -938,12 +963,11 @@ def main() -> None:
         if detail is None:
             skipped_404 += 1
             continue
-
         rows = _build_rows_for_event(cfg, detail, occ_hints=occ_map.get(eid))
         all_rows.extend(rows)
 
     before = len(all_rows)
-    all_rows = _dedupe_rows(all_rows)
+    all_rows = _dedupe_rows_global(all_rows)
     after = len(all_rows)
 
     # strip internal fields before writing
