@@ -15,12 +15,12 @@ Fixes included in this version:
     * For duplicates on same date(s), keep the row that contains times (prefer timeful over timeless).
 - Writes comma CSV by default (set CSV_DELIMITER=tab for TSV).
 
-NEW IN THIS PATCH:
-- "All-day" handling is now reliable even when list-page hints omit allday/hide_time:
-    * If the event detail marks an occurrence as all-day/hide_time for the same date range,
-      we force start_time/end_time to blank for that row.
-- Adds a CSV "title" column and sets it to the FACILITY (fallback to event title).
-  This fixes your UI showing "Clinic" instead of the facility name.
+NEW in this version:
+- Adds "title" and "clinic_type" columns (matching your "raw file" export format).
+- Blanks start_time/end_time for "all-day" events.
+- Optionally forces POPUP clinics (telehealth=No) to be treated as all-day (blank times),
+  because your UI doesn’t want to show 8:00 AM–6:00 PM for popup clinics.
+  Control with env var POPUP_ALLDAY (default: 1).
 
 Required env vars:
 - MEC_BASE_URL  e.g. https://www.ramusa.org/wp-json/mec/v1.0
@@ -28,16 +28,17 @@ Required env vars:
 - CSV_PATH      output file path in repo
 
 Optional env vars:
-- MEC_START      YYYY-MM-DD (default: 2010-01-01)
-- MEC_END        YYYY-MM-DD (default: 2030-12-31)
-- MEC_LIMIT      int (default: 200)
-- MAX_PAGES      int (default: 5000)  # safety cap for pagination loops
-- MAX_SPAN_DAYS  int (default: 10)    # skip weird huge multi-day spans
-- CSV_DELIMITER  "comma" or "tab" (default: comma)
-- DATE_FORMAT    "mdy" or "ymd" (default: mdy)
-- INCLUDE_PAST   "1" include past events (default: 1)
+- MEC_START       YYYY-MM-DD (default: 2010-01-01)
+- MEC_END         YYYY-MM-DD (default: 2030-12-31)
+- MEC_LIMIT       int (default: 200)
+- MAX_PAGES       int (default: 5000)  # safety cap for pagination loops
+- MAX_SPAN_DAYS   int (default: 10)    # skip weird huge multi-day spans
+- CSV_DELIMITER   "comma" or "tab" (default: comma)
+- DATE_FORMAT     "mdy" or "ymd" (default: mdy)
+- INCLUDE_PAST    "1" include past events (default: 1)
 - INCLUDE_ONGOING "1" include ongoing events (default: 1)
-- MEC_DEBUG      "1" to print diagnostics
+- POPUP_ALLDAY    "1" blank times for popup clinics (telehealth=No) (default: 1)
+- MEC_DEBUG       "1" to print diagnostics
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ _STATE_ABBR = {
     "puerto rico": "PR",
 }
 
-# NOTE: Added "title" so your page JS will display facility in bold (it already prefers "title").
+# Matches your "raw file looks like this" header order
 DEFAULT_HEADER: List[str] = [
     "canceled",
     "lat",
@@ -76,8 +77,9 @@ DEFAULT_HEADER: List[str] = [
     "city",
     "state",
     "site",
-    "title",       # NEW
+    "title",
     "facility",
+    "clinic_type",
     "telehealth",
     "start_time",
     "end_time",
@@ -186,10 +188,6 @@ def _coerce_text(v: Any) -> str:
     return str(v).strip()
 
 
-def _is_truthy(v: Any) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
 @dataclass(frozen=True)
 class Cfg:
     base_url: str
@@ -204,6 +202,7 @@ class Cfg:
     date_format: str
     include_past: bool
     include_ongoing: bool
+    popup_allday: bool
     debug: bool
 
 
@@ -558,17 +557,19 @@ def _extract_occ_hint_from_list_item(item: Dict[str, Any]) -> List[Dict[str, Any
     return uniq
 
 
-def _occ_to_row_dates_times(occ: Dict[str, Any], cfg: Cfg) -> Dict[str, str]:
+def _occ_to_row_dates_times(occ: Dict[str, Any], cfg: Cfg, *, force_all_day: bool) -> Dict[str, str]:
     s_obj = occ.get("start") or {}
     e_obj = occ.get("end") or {}
     s_date = str(s_obj.get("date") or "").strip()
     e_date = str(e_obj.get("date") or s_date or "").strip()
 
-    allday = _is_truthy(occ.get("allday") or "0")
-    hide_time = _is_truthy(occ.get("hide_time") or "0")
+    allday = str(occ.get("allday") or "0").strip().lower() in {"1", "true", "yes"}
+    hide_time = str(occ.get("hide_time") or "0").strip().lower() in {"1", "true", "yes"}
 
-    start_time = "" if (allday or hide_time) else _format_time(s_obj.get("hour"), s_obj.get("minutes"), s_obj.get("ampm"))
-    end_time = "" if (allday or hide_time) else _format_time(e_obj.get("hour"), e_obj.get("minutes"), e_obj.get("ampm"))
+    is_all_day = force_all_day or allday or hide_time
+
+    start_time = "" if is_all_day else _format_time(s_obj.get("hour"), s_obj.get("minutes"), s_obj.get("ampm"))
+    end_time = "" if is_all_day else _format_time(e_obj.get("hour"), e_obj.get("minutes"), e_obj.get("ampm"))
 
     return {
         "start_date": _format_date(s_date, cfg.date_format),
@@ -577,6 +578,7 @@ def _occ_to_row_dates_times(occ: Dict[str, Any], cfg: Cfg) -> Dict[str, str]:
         "end_time": end_time,
         "_start_ymd": s_date,
         "_end_ymd": e_date,
+        "_is_all_day": "1" if is_all_day else "0",
     }
 
 
@@ -792,31 +794,6 @@ def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[s
     return out
 
 
-def _build_detail_all_day_map(detail: Dict[str, Any], cfg: Cfg) -> Dict[Tuple[str, str], bool]:
-    """
-    Build a map from (start_ymd, end_ymd) -> True if any matching occurrence in the DETAIL
-    is marked all-day or hide_time.
-
-    This lets us correct list-page hints that include hours but omit the all-day flag.
-    """
-    m: Dict[Tuple[str, str], bool] = {}
-    detail_occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
-    for o in detail_occs:
-        s = o.get("start") or {}
-        e = o.get("end") or {}
-        s_date = str(s.get("date") or "").strip()
-        e_date = str(e.get("date") or s_date or "").strip()
-        if not s_date:
-            continue
-        key = (s_date, e_date)
-        flagged = _is_truthy(o.get("allday")) or _is_truthy(o.get("hide_time"))
-        if flagged:
-            m[key] = True
-        else:
-            m.setdefault(key, False)
-    return m
-
-
 def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
     data = detail.get("data", {})
     if not isinstance(data, dict):
@@ -836,14 +813,16 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
     event_title = str(data.get("title") or "").strip()
     url = str(data.get("permalink") or "").strip()
 
-    # Prefer hints for performance/coverage, but we will FIX all-day flags using detail.
-    if occ_hints:
-        occs = occ_hints
-    else:
-        occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
+    # Determine clinic type (what your UI calls these)
+    is_telehealth = bool(ctype["telehealth"])
+    clinic_type_label = "Telehealth Clinic" if is_telehealth else "Popup Clinic"
 
-    # Build detail all-day flags by date-range so list hints can't accidentally keep times.
-    detail_all_day = _build_detail_all_day_map(detail, cfg)
+    # What should appear as the “title” in the UI?
+    # Prefer facility name, otherwise fall back to MEC event title
+    display_title = loc["facility"].strip() or event_title
+
+    # Occurrences:
+    occs = occ_hints if occ_hints else _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
 
     if cfg.debug:
         if fields.get("services"):
@@ -857,25 +836,11 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
     if not occs:
         occs = [{"start": {"date": ""}, "end": {"date": ""}, "allday": "1", "hide_time": "1"}]
 
-    # CSV "title" should be facility (so UI shows it), fallback to event title, fallback to "Clinic".
-    csv_title = (loc.get("facility") or "").strip() or event_title or "Clinic"
-
     rows: List[Dict[str, str]] = []
     for occ in occs:
-        # Fix all-day/hide_time from detail for the same date-range (if hint omitted it).
-        s_obj = occ.get("start") or {}
-        e_obj = occ.get("end") or {}
-        s_date = str(s_obj.get("date") or "").strip()
-        e_date = str(e_obj.get("date") or s_date or "").strip()
-        if s_date:
-            key = (s_date, e_date)
-            if detail_all_day.get(key) is True:
-                # Force blank times
-                occ = dict(occ)
-                occ["allday"] = "1"
-                occ["hide_time"] = "1"
-
-        dt = _occ_to_row_dates_times(occ, cfg)
+        # Force popup clinics to be "all day" (blank times) if POPUP_ALLDAY=1
+        force_all_day = (cfg.popup_allday and not is_telehealth)
+        dt = _occ_to_row_dates_times(occ, cfg, force_all_day=force_all_day)
 
         row: Dict[str, str] = {h: "" for h in DEFAULT_HEADER}
         row["canceled"] = _yn(canceled)
@@ -886,16 +851,20 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         row["state"] = loc["state"]
         row["site"] = _safe_site(loc["city"], loc["state"])
 
-        row["title"] = csv_title              # NEW: used by your page to show bold header
-        row["facility"] = loc["facility"]
+        row["title"] = display_title
+        row["facility"] = loc["facility"].strip() or display_title
 
-        row["telehealth"] = _yn(ctype["telehealth"])
+        row["clinic_type"] = clinic_type_label
+        row["telehealth"] = _yn(is_telehealth)
+
         row["start_time"] = dt["start_time"]
         row["end_time"] = dt["end_time"]
         row["start_date"] = dt["start_date"]
         row["end_date"] = dt["end_date"]
+
         row["parking_date"] = parking_date
         row["parking_time"] = parking_time
+
         row["medical"] = _yn(svc["medical"])
         row["dental"] = _yn(svc["dental"])
         row["vision"] = _yn(svc["vision"])
@@ -906,6 +875,7 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         row["_start_ymd"] = dt["_start_ymd"]
         row["_end_ymd"] = dt["_end_ymd"]
         row["_title"] = event_title
+        row["_is_all_day"] = dt["_is_all_day"]
 
         rows.append(row)
 
@@ -960,6 +930,7 @@ def _load_cfg() -> Cfg:
     max_span_days = int((os.environ.get("MAX_SPAN_DAYS", "10") or "10").strip())
 
     debug = (os.environ.get("MEC_DEBUG", "") or "").strip().lower() in {"1", "true", "yes", "y"}
+    popup_allday = (os.environ.get("POPUP_ALLDAY", "1") or "1").strip().lower() in {"1", "true", "yes", "y"}
 
     delimiter = _get_delimiter()
     date_format = (os.environ.get("DATE_FORMAT", "mdy") or "mdy").strip().lower()
@@ -988,6 +959,7 @@ def _load_cfg() -> Cfg:
         date_format=date_format,
         include_past=include_past,
         include_ongoing=include_ongoing,
+        popup_allday=popup_allday,
         debug=debug,
     )
 
@@ -998,7 +970,7 @@ def main() -> None:
 
     print(f"[cfg] base_url={cfg.base_url}")
     print(f"[cfg] start={cfg.start} end={cfg.end} limit={cfg.limit} max_pages={cfg.max_pages} max_span_days={cfg.max_span_days}")
-    print(f"[cfg] include_past={int(cfg.include_past)} include_ongoing={int(cfg.include_ongoing)}")
+    print(f"[cfg] include_past={int(cfg.include_past)} include_ongoing={int(cfg.include_ongoing)} popup_allday={int(cfg.popup_allday)}")
     print(f"[cfg] csv_path={cfg.csv_path} delimiter={delimiter_label} date_format={cfg.date_format}")
 
     sess = _session()
@@ -1026,6 +998,7 @@ def main() -> None:
         r.pop("_start_ymd", None)
         r.pop("_end_ymd", None)
         r.pop("_title", None)
+        r.pop("_is_all_day", None)
 
     _write_csv(cfg, all_rows)
     print(f"Wrote {len(all_rows)} rows to {cfg.csv_path} (skipped_404={skipped_404}, deduped={before - after})")
