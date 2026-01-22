@@ -13,11 +13,14 @@ Fixes included in this version:
 - Per-event row cleanup to eliminate duplicates and bad "range" rows:
     * If any single-day rows exist, drop multi-day range rows for that event.
     * For duplicates on same date(s), keep the row that contains times (prefer timeful over timeless).
-- **NEW (All-day fix)**:
-    * If the event detail payload marks an occurrence as all-day (or hide_time),
-      force the list-hint occurrence to be treated as all-day so CSV times stay BLANK.
-      (This prevents “8:00 AM – 6:00 PM” from showing up for All-day events.)
 - Writes comma CSV by default (set CSV_DELIMITER=tab for TSV).
+
+NEW IN THIS PATCH:
+- "All-day" handling is now reliable even when list-page hints omit allday/hide_time:
+    * If the event detail marks an occurrence as all-day/hide_time for the same date range,
+      we force start_time/end_time to blank for that row.
+- Adds a CSV "title" column and sets it to the FACILITY (fallback to event title).
+  This fixes your UI showing "Clinic" instead of the facility name.
 
 Required env vars:
 - MEC_BASE_URL  e.g. https://www.ramusa.org/wp-json/mec/v1.0
@@ -64,6 +67,7 @@ _STATE_ABBR = {
     "puerto rico": "PR",
 }
 
+# NOTE: Added "title" so your page JS will display facility in bold (it already prefers "title").
 DEFAULT_HEADER: List[str] = [
     "canceled",
     "lat",
@@ -72,6 +76,7 @@ DEFAULT_HEADER: List[str] = [
     "city",
     "state",
     "site",
+    "title",       # NEW
     "facility",
     "telehealth",
     "start_time",
@@ -181,6 +186,10 @@ def _coerce_text(v: Any) -> str:
     return str(v).strip()
 
 
+def _is_truthy(v: Any) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass(frozen=True)
 class Cfg:
     base_url: str
@@ -207,7 +216,7 @@ def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
         {
-            "User-Agent": "ram-mec-sync/2.2",
+            "User-Agent": "ram-mec-sync/2.3",
             "Accept": "application/json,text/plain,*/*",
         }
     )
@@ -417,56 +426,6 @@ def _extract_canceled(event_data: Dict[str, Any]) -> bool:
 _YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def _truthy(v: Any) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y"}
-
-
-def _merge_hints_with_detail_all_day(
-    hints: List[Dict[str, Any]],
-    detail_occs: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """
-    MEC list results sometimes omit allday/hide_time and instead give default times (e.g. 8–6).
-    If the detail payload says an occurrence is all-day, force the hint to be treated as all-day
-    so the CSV times are blank.
-    """
-    if not hints:
-        return hints
-    if not detail_occs:
-        return hints
-
-    all_day_pairs: Set[Tuple[str, str]] = set()
-    for o in detail_occs:
-        s = o.get("start") or {}
-        e = o.get("end") or {}
-        sd = str(s.get("date") or "").strip()
-        ed = str(e.get("date") or sd).strip()
-        if not sd:
-            continue
-        if _truthy(o.get("allday")) or _truthy(o.get("hide_time")):
-            all_day_pairs.add((sd, ed))
-
-    if not all_day_pairs:
-        return hints
-
-    out: List[Dict[str, Any]] = []
-    for h in hints:
-        s = h.get("start") or {}
-        e = h.get("end") or {}
-        sd = str(s.get("date") or "").strip()
-        ed = str(e.get("date") or sd).strip()
-
-        if (sd, ed) in all_day_pairs:
-            hh = dict(h)
-            hh["allday"] = "1"
-            hh["hide_time"] = "1"
-            out.append(hh)
-        else:
-            out.append(h)
-
-    return out
-
-
 def _find_occurrence_blocks_anywhere(obj: Any) -> Iterable[Dict[str, Any]]:
     stack = [obj]
     while stack:
@@ -605,8 +564,8 @@ def _occ_to_row_dates_times(occ: Dict[str, Any], cfg: Cfg) -> Dict[str, str]:
     s_date = str(s_obj.get("date") or "").strip()
     e_date = str(e_obj.get("date") or s_date or "").strip()
 
-    allday = str(occ.get("allday") or "0").strip().lower() in {"1", "true", "yes"}
-    hide_time = str(occ.get("hide_time") or "0").strip().lower() in {"1", "true", "yes"}
+    allday = _is_truthy(occ.get("allday") or "0")
+    hide_time = _is_truthy(occ.get("hide_time") or "0")
 
     start_time = "" if (allday or hide_time) else _format_time(s_obj.get("hour"), s_obj.get("minutes"), s_obj.get("ampm"))
     end_time = "" if (allday or hide_time) else _format_time(e_obj.get("hour"), e_obj.get("minutes"), e_obj.get("ampm"))
@@ -833,6 +792,31 @@ def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[s
     return out
 
 
+def _build_detail_all_day_map(detail: Dict[str, Any], cfg: Cfg) -> Dict[Tuple[str, str], bool]:
+    """
+    Build a map from (start_ymd, end_ymd) -> True if any matching occurrence in the DETAIL
+    is marked all-day or hide_time.
+
+    This lets us correct list-page hints that include hours but omit the all-day flag.
+    """
+    m: Dict[Tuple[str, str], bool] = {}
+    detail_occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
+    for o in detail_occs:
+        s = o.get("start") or {}
+        e = o.get("end") or {}
+        s_date = str(s.get("date") or "").strip()
+        e_date = str(e.get("date") or s_date or "").strip()
+        if not s_date:
+            continue
+        key = (s_date, e_date)
+        flagged = _is_truthy(o.get("allday")) or _is_truthy(o.get("hide_time"))
+        if flagged:
+            m[key] = True
+        else:
+            m.setdefault(key, False)
+    return m
+
+
 def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
     data = detail.get("data", {})
     if not isinstance(data, dict):
@@ -849,31 +833,48 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
     parking_date = fields.get("parking_date", "").strip()
     parking_time = fields.get("parking_time", "").strip()
 
-    title = str(data.get("title") or "").strip()
+    event_title = str(data.get("title") or "").strip()
     url = str(data.get("permalink") or "").strip()
 
-    # Occurrences:
-    detail_occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
+    # Prefer hints for performance/coverage, but we will FIX all-day flags using detail.
     if occ_hints:
-        # NEW: If detail says "all day", force hints to behave as all-day so times export blank.
-        occs = _merge_hints_with_detail_all_day(occ_hints, detail_occs)
+        occs = occ_hints
     else:
-        occs = detail_occs
+        occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
+
+    # Build detail all-day flags by date-range so list hints can't accidentally keep times.
+    detail_all_day = _build_detail_all_day_map(detail, cfg)
 
     if cfg.debug:
         if fields.get("services"):
-            _debug(cfg, f"[svc] services_field='{fields.get('services')}' title='{title}'")
+            _debug(cfg, f"[svc] services_field='{fields.get('services')}' title='{event_title}'")
         else:
-            _debug(cfg, f"[svc] services_field=MISSING title='{title}' (taxonomy fallback: '{tax_text}')")
+            _debug(cfg, f"[svc] services_field=MISSING title='{event_title}' (taxonomy fallback: '{tax_text}')")
         if not occs:
             eid = data.get("ID") or data.get("id")
-            _debug(cfg, f"[warn] No occurrences parsed for event {eid} title={title!r}")
+            _debug(cfg, f"[warn] No occurrences parsed for event {eid} title={event_title!r}")
 
     if not occs:
         occs = [{"start": {"date": ""}, "end": {"date": ""}, "allday": "1", "hide_time": "1"}]
 
+    # CSV "title" should be facility (so UI shows it), fallback to event title, fallback to "Clinic".
+    csv_title = (loc.get("facility") or "").strip() or event_title or "Clinic"
+
     rows: List[Dict[str, str]] = []
     for occ in occs:
+        # Fix all-day/hide_time from detail for the same date-range (if hint omitted it).
+        s_obj = occ.get("start") or {}
+        e_obj = occ.get("end") or {}
+        s_date = str(s_obj.get("date") or "").strip()
+        e_date = str(e_obj.get("date") or s_date or "").strip()
+        if s_date:
+            key = (s_date, e_date)
+            if detail_all_day.get(key) is True:
+                # Force blank times
+                occ = dict(occ)
+                occ["allday"] = "1"
+                occ["hide_time"] = "1"
+
         dt = _occ_to_row_dates_times(occ, cfg)
 
         row: Dict[str, str] = {h: "" for h in DEFAULT_HEADER}
@@ -884,7 +885,10 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         row["city"] = loc["city"]
         row["state"] = loc["state"]
         row["site"] = _safe_site(loc["city"], loc["state"])
+
+        row["title"] = csv_title              # NEW: used by your page to show bold header
         row["facility"] = loc["facility"]
+
         row["telehealth"] = _yn(ctype["telehealth"])
         row["start_time"] = dt["start_time"]
         row["end_time"] = dt["end_time"]
@@ -901,7 +905,7 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         # internal fields used for cleanup/dedupe
         row["_start_ymd"] = dt["_start_ymd"]
         row["_end_ymd"] = dt["_end_ymd"]
-        row["_title"] = title
+        row["_title"] = event_title
 
         rows.append(row)
 
