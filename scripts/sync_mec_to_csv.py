@@ -10,9 +10,13 @@ Fixes included in this version:
 - Extracts occurrences robustly:
     * Builds per-occurrence hints from the /events list response (deep-scans each list item for start/end blocks).
     * Falls back to scanning the event detail payload for occurrences.
-- **NEW**: Per-event row cleanup to eliminate duplicates and bad "range" rows:
+- Per-event row cleanup to eliminate duplicates and bad "range" rows:
     * If any single-day rows exist, drop multi-day range rows for that event.
     * For duplicates on same date(s), keep the row that contains times (prefer timeful over timeless).
+- **NEW (All-day fix)**:
+    * If the event detail payload marks an occurrence as all-day (or hide_time),
+      force the list-hint occurrence to be treated as all-day so CSV times stay BLANK.
+      (This prevents “8:00 AM – 6:00 PM” from showing up for All-day events.)
 - Writes comma CSV by default (set CSV_DELIMITER=tab for TSV).
 
 Required env vars:
@@ -413,6 +417,56 @@ def _extract_canceled(event_data: Dict[str, Any]) -> bool:
 _YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def _truthy(v: Any) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _merge_hints_with_detail_all_day(
+    hints: List[Dict[str, Any]],
+    detail_occs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    MEC list results sometimes omit allday/hide_time and instead give default times (e.g. 8–6).
+    If the detail payload says an occurrence is all-day, force the hint to be treated as all-day
+    so the CSV times are blank.
+    """
+    if not hints:
+        return hints
+    if not detail_occs:
+        return hints
+
+    all_day_pairs: Set[Tuple[str, str]] = set()
+    for o in detail_occs:
+        s = o.get("start") or {}
+        e = o.get("end") or {}
+        sd = str(s.get("date") or "").strip()
+        ed = str(e.get("date") or sd).strip()
+        if not sd:
+            continue
+        if _truthy(o.get("allday")) or _truthy(o.get("hide_time")):
+            all_day_pairs.add((sd, ed))
+
+    if not all_day_pairs:
+        return hints
+
+    out: List[Dict[str, Any]] = []
+    for h in hints:
+        s = h.get("start") or {}
+        e = h.get("end") or {}
+        sd = str(s.get("date") or "").strip()
+        ed = str(e.get("date") or sd).strip()
+
+        if (sd, ed) in all_day_pairs:
+            hh = dict(h)
+            hh["allday"] = "1"
+            hh["hide_time"] = "1"
+            out.append(hh)
+        else:
+            out.append(h)
+
+    return out
+
+
 def _find_occurrence_blocks_anywhere(obj: Any) -> Iterable[Dict[str, Any]]:
     stack = [obj]
     while stack:
@@ -731,10 +785,8 @@ def _iter_all_occurrences(cfg: Cfg, sess: requests.Session) -> Tuple[Set[int], D
 
 def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[str, str]]:
     """
-    Fixes the exact issues in your CSV:
-
     1) If the event has ANY single-day rows (start_ymd == end_ymd),
-       drop all multi-day rows for that event. (Removes the unwanted 8/29–8/30 "range row".)
+       drop all multi-day rows for that event.
 
     2) Collapse duplicates for the same date(s):
        keep the row that has times (prefer timeful over timeless).
@@ -754,7 +806,6 @@ def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[s
 
     # 2) collapse timeless duplicates, preferring timeful
     best: Dict[Tuple[str, str, str, str, str], Dict[str, str]] = {}
-    # key includes url+facility+date(s)+telehealth (some MEC events share url but differ facility rarely)
     for r in rows:
         key = (
             (r.get("url") or "").strip().lower(),
@@ -767,12 +818,10 @@ def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[s
         if cur is None:
             best[key] = r
             continue
-        # choose row with times
         if has_time(r) and not has_time(cur):
             best[key] = r
             continue
         if has_time(r) == has_time(cur):
-            # tie-breaker: keep the one with more filled fields (parking often only on one)
             score_r = sum(1 for k in ("parking_date", "parking_time") if (r.get(k) or "").strip())
             score_c = sum(1 for k in ("parking_date", "parking_time") if (cur.get(k) or "").strip())
             if score_r > score_c:
@@ -804,10 +853,12 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
     url = str(data.get("permalink") or "").strip()
 
     # Occurrences:
+    detail_occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
     if occ_hints:
-        occs = occ_hints
+        # NEW: If detail says "all day", force hints to behave as all-day so times export blank.
+        occs = _merge_hints_with_detail_all_day(occ_hints, detail_occs)
     else:
-        occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
+        occs = detail_occs
 
     if cfg.debug:
         if fields.get("services"):
@@ -854,16 +905,12 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
 
         rows.append(row)
 
-    # **critical cleanup**
     rows = _postprocess_event_rows(rows, cfg)
-
     return rows
 
 
 def _dedupe_rows_global(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Final safety net across all events.
-    """
+    """Final safety net across all events."""
     seen: Set[Tuple[str, str, str, str, str, str, str]] = set()
     out: List[Dict[str, str]] = []
     for r in rows:
