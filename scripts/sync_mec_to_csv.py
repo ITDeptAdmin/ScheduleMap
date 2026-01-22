@@ -2,23 +2,36 @@
 """
 sync_mec_to_csv.py
 
-Fetch events from a MEC-like API and write a normalized CSV.
+Fetch events from a MEC (Modern Events Calendar) JSON API and write a normalized CSV.
 
-Rule:
-  - If an event is marked "All-day", the CSV start_time/end_time are blank.
+Key behaviors (based on your requirements / logs):
+- Paginates /events using start_date + offset + limit
+- Collects unique event IDs plus "occurrence hints" (dates seen on list pages)
+- Fetches /events/{id} for each ID and emits rows:
+    * If we have occurrence hints -> one row per hint date (single-day rows)
+    * Else -> one row from the event's own start/end date
+- For multi-day events (start_date != end_date) that are "all-day", we collapse to ONE row
+  on the end_date (matches your "dropped range rows: 3 -> 1" behavior).
+- If event is all-day: start_time/end_time are BLANK in CSV.
+- Collapses duplicates by date within an event (keeps the "best" row with times/services/etc).
+- Adds safe retry for transient 5xx responses and avoids the offset=1 @ ancient dates issue
+  by falling back to event-detail date inference when list items don't include usable dates.
 
 Env vars:
-  MEC_BASE_URL   (required)
-  MEC_TOKEN      (optional)
-  CSV_PATH       (required)
-  MEC_START      default: 2010-01-01
-  MEC_END        default: 2030-12-31
-  MEC_LIMIT      default: 200
-  MAX_PAGES      default: 50
-  MAX_SPAN_DAYS  default: 10
-  CSV_DELIMITER  default: comma  (comma|tab|pipe|semicolon)
-  DATE_FORMAT    default: mdy    (mdy|ymd)
-  MEC_DEBUG      default: 0/1
+  MEC_BASE_URL      (required)  e.g. https://example.com/wp-json/mec/v1
+  MEC_TOKEN         (optional)  token if your endpoint requires auth
+  CSV_PATH          (optional)  default: Clinic Master Schedule for git.csv
+  MEC_START         (optional)  default: 2010-01-01
+  MEC_END           (optional)  default: 2030-12-31
+  MEC_LIMIT         (optional)  default: 200
+  MAX_PAGES         (optional)  default: 50
+  CSV_DELIMITER     (optional)  comma|tab|pipe  default: comma
+  DATE_FORMAT       (optional)  mdy|ymd        default: mdy
+  MEC_DEBUG         (optional)  1 enables debug logs
+
+CSV columns:
+canceled,lat,lng,address,city,state,site,facility,telehealth,start_time,end_time,
+start_date,end_date,parking_date,parking_time,medical,dental,vision,dentures,url
 """
 
 from __future__ import annotations
@@ -26,6 +39,8 @@ from __future__ import annotations
 import csv
 import os
 import re
+import sys
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -33,503 +48,574 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 
-# ----------------------------
-# Config & logging
-# ----------------------------
-
-def env(name: str, default: Optional[str] = None) -> str:
-    v = os.getenv(name, default)
-    if v is None:
-        raise SystemExit(f"Missing required env var: {name}")
-    return v
-
-def to_bool(v: str) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
+# -------------------------
+# Logging / debug
+# -------------------------
 
 def debug_enabled() -> bool:
-    return to_bool(os.getenv("MEC_DEBUG", "0"))
+    return os.getenv("MEC_DEBUG", "").strip() not in ("", "0", "false", "False")
+
 
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    print(msg, file=sys.stderr)
 
-def delimiter_from_env(v: str) -> str:
-    m = v.strip().lower()
-    if m in ("comma", ","):
+
+# -------------------------
+# Config
+# -------------------------
+
+def parse_date_ymd(s: str, default: date) -> date:
+    s = (s or "").strip()
+    if not s:
+        return default
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return default
+
+
+def parse_int(s: str, default: int) -> int:
+    try:
+        return int(str(s).strip())
+    except Exception:
+        return default
+
+
+def parse_delimiter(name: str) -> str:
+    name = (name or "").strip().lower()
+    if name in ("comma", ",", "csv"):
         return ","
-    if m in ("tab", "\\t", "tsv"):
+    if name in ("tab", "\\t", "tsv"):
         return "\t"
-    if m in ("pipe", "|"):
+    if name in ("pipe", "|"):
         return "|"
-    if m in ("semicolon", ";"):
-        return ";"
-    raise SystemExit(f"Unknown CSV_DELIMITER: {v}")
+    return ","
 
-
-# ----------------------------
-# Date/time parsing/formatting
-# ----------------------------
-
-def parse_iso_date(s: str) -> date:
-    return datetime.strptime(s.strip(), "%Y-%m-%d").date()
-
-def parse_any_date(s: str) -> Optional[date]:
-    if not s:
-        return None
-    s = s.strip()
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    return None
-
-def format_date(d: date, mode: str) -> str:
-    if mode == "ymd":
-        return d.strftime("%Y-%m-%d")
-    if mode == "mdy":
-        return f"{d.month}/{d.day}/{d.year}"
-    raise SystemExit(f"Unknown DATE_FORMAT: {mode}")
-
-def normalize_time_str(s: str) -> str:
-    if not s:
-        return ""
-    s = s.strip()
-    if re.search(r"\b(AM|PM)\b", s, flags=re.IGNORECASE):
-        s = re.sub(r"\b(am|pm)\b", lambda m: m.group(1).upper(), s, flags=re.IGNORECASE)
-        return s
-    for fmt in ("%H:%M", "%H:%M:%S"):
-        try:
-            t = datetime.strptime(s, fmt).time()
-            # %-I may not work on Windows; keep it safe:
-            hour = int(t.strftime("%I"))
-            minute = t.strftime("%M")
-            ampm = t.strftime("%p")
-            return f"{hour}:{minute} {ampm}"
-        except Exception:
-            pass
-    return s
-
-
-# ----------------------------
-# MEC API client
-# ----------------------------
 
 @dataclass
 class Cfg:
     base_url: str
     token: str
     csv_path: str
+    delimiter: str
+    date_format: str  # "mdy" or "ymd"
     start: date
     end: date
     limit: int
     max_pages: int
-    max_span_days: int
-    csv_delimiter: str
-    date_format: str
-    include_past: bool = True
-    include_ongoing: bool = True
+    include_past: bool
+    include_ongoing: bool
 
 
-def _looks_like_event_list(x: Any) -> bool:
-    if not isinstance(x, list) or not x:
-        return False
-    if not isinstance(x[0], dict):
-        return False
-    # Many event items include one of these
-    keys = set(x[0].keys())
-    return bool(keys.intersection({"id", "ID", "event_id", "title", "start_date", "date_start"}))
+def load_cfg() -> Cfg:
+    base_url = os.getenv("MEC_BASE_URL", "").strip()
+    if not base_url:
+        raise SystemExit("MEC_BASE_URL is required")
 
-def _find_event_list_anywhere(obj: Any, max_depth: int = 6) -> Optional[List[Dict[str, Any]]]:
-    """
-    Recursively search for a list of dicts that looks like an event list.
-    This fixes the '200 but items=0' case when payload is nested.
-    """
-    if max_depth < 0:
-        return None
+    token = os.getenv("MEC_TOKEN", "").strip()
+    csv_path = os.getenv("CSV_PATH", "Clinic Master Schedule for git.csv").strip()
 
-    if _looks_like_event_list(obj):
-        return obj  # type: ignore[return-value]
+    delimiter = parse_delimiter(os.getenv("CSV_DELIMITER", "comma"))
+    date_format = (os.getenv("DATE_FORMAT", "mdy") or "mdy").strip().lower()
+    if date_format not in ("mdy", "ymd"):
+        date_format = "mdy"
 
-    if isinstance(obj, dict):
-        # common containers first
-        for k in ("events", "items", "data", "results", "posts"):
-            if k in obj:
-                found = _find_event_list_anywhere(obj[k], max_depth=max_depth - 1)
-                if found is not None:
-                    return found
+    start = parse_date_ymd(os.getenv("MEC_START", "2010-01-01"), date(2010, 1, 1))
+    end = parse_date_ymd(os.getenv("MEC_END", "2030-12-31"), date(2030, 12, 31))
 
-        # otherwise scan all values
-        for v in obj.values():
-            found = _find_event_list_anywhere(v, max_depth=max_depth - 1)
-            if found is not None:
-                return found
+    limit = parse_int(os.getenv("MEC_LIMIT", "200"), 200)
+    max_pages = parse_int(os.getenv("MAX_PAGES", "50"), 50)
 
-    if isinstance(obj, list):
-        for v in obj:
-            found = _find_event_list_anywhere(v, max_depth=max_depth - 1)
-            if found is not None:
-                return found
+    # based on your logs you always include these
+    include_past = True
+    include_ongoing = True
 
-    return None
+    if debug_enabled():
+        log(f"[cfg] base_url=***")
+        log(
+            f"[cfg] start={start.isoformat()} end={end.isoformat()} "
+            f"limit={limit} max_pages={max_pages}"
+        )
+        log(
+            f"[cfg] include_past={1 if include_past else 0} "
+            f"include_ongoing={1 if include_ongoing else 0}"
+        )
+        log(
+            f"[cfg] csv_path={csv_path} delimiter="
+            f"{'COMMA' if delimiter==',' else delimiter!r} date_format={date_format}"
+        )
 
-
-class MecClient:
-    def __init__(self, cfg: Cfg):
-        self.cfg = cfg
-        self.sess = requests.Session()
-        self.sess.headers.update({"Accept": "application/json"})
-        if cfg.token:
-            self.sess.headers.update({"Authorization": f"Bearer {cfg.token}"})
-
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        url = self.cfg.base_url.rstrip("/") + path
-        r = self.sess.get(url, params=params, timeout=60)
-        if debug_enabled():
-            q = ""
-            if params:
-                q = "?" + "&".join([f"{k}={params[k]}" for k in params])
-            log(f"[mec] GET {url}{q} -> {r.status_code}")
-        r.raise_for_status()
-        return r.json()
-
-    def list_events_page(self, start_date: date, offset: int) -> List[Dict[str, Any]]:
-        params = {
-            "limit": self.cfg.limit,
-            "include_past_events": 1 if self.cfg.include_past else 0,
-            "include_ongoing_events": 1 if self.cfg.include_ongoing else 0,
-            "start_date": start_date.strftime("%Y-%m-%d"),
-            "offset": offset,
-        }
-        data = self._get("/events", params=params)
-
-        found = _find_event_list_anywhere(data)
-        if found is None:
-            if debug_enabled():
-                if isinstance(data, dict):
-                    log(f"[mec] Could not locate event list in response. Top-level keys: {list(data.keys())}")
-                else:
-                    log(f"[mec] Could not locate event list in response. Type: {type(data)}")
-            return []
-
-        return found
-
-    def get_event(self, event_id: int) -> Dict[str, Any]:
-        data = self._get(f"/events/{event_id}")
-        # common wrappers
-        if isinstance(data, dict):
-            if "data" in data and isinstance(data["data"], dict):
-                return data["data"]
-        return data if isinstance(data, dict) else {}
+    return Cfg(
+        base_url=base_url,
+        token=token,
+        csv_path=csv_path,
+        delimiter=delimiter,
+        date_format=date_format,
+        start=start,
+        end=end,
+        limit=limit,
+        max_pages=max_pages,
+        include_past=include_past,
+        include_ongoing=include_ongoing,
+    )
 
 
-# ----------------------------
-# Extraction helpers
-# ----------------------------
+# -------------------------
+# Helpers
+# -------------------------
 
-def get_nested(d: Dict[str, Any], *keys: str) -> Any:
-    cur: Any = d
+def str_or_empty(x: Any) -> str:
+    return "" if x is None else str(x)
+
+
+def get_nested(d: Any, *keys: str) -> Any:
+    cur = d
     for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
+        if not isinstance(cur, dict):
+            return None
+        if k not in cur:
             return None
         cur = cur[k]
     return cur
 
-def first_non_empty(*vals: Any) -> Any:
+
+def first_nonempty(*vals: Any) -> str:
     for v in vals:
-        if v is None:
-            continue
-        if isinstance(v, str) and v.strip() == "":
-            continue
-        return v
+        s = str_or_empty(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def parse_any_date(s: str) -> Optional[date]:
+    s = (s or "").strip()
+    if not s:
+        return None
+
+    # normalize common date-time strings
+    # Accept: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, ISO-ish
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except Exception:
+            pass
+
+    # Accept: M/D/YYYY or MM/DD/YYYY
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    if m:
+        mm, dd, yyyy = m.groups()
+        try:
+            return date(int(yyyy), int(mm), int(dd))
+        except Exception:
+            return None
+
     return None
 
-def str_or_empty(v: Any) -> str:
-    if v is None:
+
+def parse_any_time(s: str) -> str:
+    """Return a normalized display time like '8:00 AM' or ''."""
+    s = (s or "").strip()
+    if not s:
         return ""
-    return str(v).strip()
 
-def parse_services(event: Dict[str, Any]) -> Tuple[str, str, str, str]:
-    raw = first_non_empty(
-        event.get("services"),
-        event.get("services_field"),
-        get_nested(event, "meta", "services"),
-        get_nested(event, "meta", "services_field"),
+    # already looks like "8:00 AM"
+    if re.search(r"\bAM\b|\bPM\b", s, re.IGNORECASE):
+        return s
+
+    # "08:00" or "8:00"
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if m:
+        hh = int(m.group(1))
+        mm = m.group(2)
+        ampm = "AM"
+        if hh == 0:
+            hh = 12
+        elif hh == 12:
+            ampm = "PM"
+        elif hh > 12:
+            hh -= 12
+            ampm = "PM"
+        return f"{hh}:{mm} {ampm}"
+
+    # "0800"
+    m = re.match(r"^(\d{2})(\d{2})$", s)
+    if m:
+        hh = int(m.group(1))
+        mm = m.group(2)
+        ampm = "AM"
+        if hh == 0:
+            hh = 12
+        elif hh == 12:
+            ampm = "PM"
+        elif hh > 12:
+            hh -= 12
+            ampm = "PM"
+        return f"{hh}:{mm} {ampm}"
+
+    return s
+
+
+def format_date(d: date, fmt: str) -> str:
+    if fmt == "ymd":
+        return d.strftime("%Y-%m-%d")
+    # mdy (your CSV)
+    return f"{d.month}/{d.day}/{d.year}"
+
+
+def truthy(x: Any) -> bool:
+    if isinstance(x, bool):
+        return x
+    s = str_or_empty(x).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+
+# -------------------------
+# MEC client
+# -------------------------
+
+class MecClient:
+    def __init__(self, cfg: Cfg) -> None:
+        self.cfg = cfg
+        self.sess = requests.Session()
+        self.sess.headers.update({"Accept": "application/json"})
+
+        # Try to be compatible with common token styles.
+        if cfg.token:
+            self.sess.headers.update(
+                {
+                    "Authorization": f"Bearer {cfg.token}",
+                    "X-API-KEY": cfg.token,
+                    "X-Auth-Token": cfg.token,
+                }
+            )
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        url = self.cfg.base_url.rstrip("/") + path
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, 4):  # 3 tries total
+            try:
+                r = self.sess.get(url, params=params, timeout=60)
+
+                if debug_enabled():
+                    q = ""
+                    if params:
+                        # (good enough for logs)
+                        q = "?" + "&".join([f"{k}={params[k]}" for k in params])
+                    log(f"[mec] GET ***/{path.lstrip('/')} {q} -> {r.status_code}")
+
+                # retry transient 5xx
+                if r.status_code >= 500 and attempt < 3:
+                    time.sleep(1)
+                    continue
+
+                r.raise_for_status()
+                return r.json()
+
+            except Exception as e:
+                last_exc = e
+                if attempt < 3:
+                    time.sleep(1)
+                    continue
+                raise
+
+        raise last_exc or RuntimeError("Unknown request failure")
+
+    def list_events_page(self, start_date: date, offset: int) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "limit": self.cfg.limit,
+            "start_date": start_date.isoformat(),
+            "offset": offset,
+            "include_past_events": 1 if self.cfg.include_past else 0,
+            "include_ongoing_events": 1 if self.cfg.include_ongoing else 0,
+        }
+        data = self._get("/events", params=params)
+
+        # Different MEC installs return shapes like:
+        # { "events": [...] } or { "data": [...] } or directly [...]
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for k in ("events", "data", "items", "results"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+        return []
+
+    def get_event(self, event_id: int) -> Dict[str, Any]:
+        data = self._get(f"/events/{event_id}", params=None)
+        if isinstance(data, dict):
+            return data
+        return {}
+
+
+# -------------------------
+# List-page date extraction
+# -------------------------
+
+def extract_list_item_start_date(it: Dict[str, Any]) -> Optional[date]:
+    """
+    Try hard to pull a start date from list-page event items, which often have
+    different shapes than /events/{id}.
+    """
+    candidates = [
+        it.get("start_date"),
+        it.get("date_start"),
+        it.get("start"),
+        it.get("startDate"),
+        it.get("start_date_local"),
+        get_nested(it, "meta", "start_date"),
+        get_nested(it, "mec", "start_date"),
+        get_nested(it, "data", "start_date"),
+        # sometimes in "date" / "occurrence"
+        it.get("date"),
+        it.get("occurrence"),
+        get_nested(it, "meta", "date"),
+    ]
+    for c in candidates:
+        d = parse_any_date(str_or_empty(c))
+        if d:
+            return d
+    return None
+
+
+def extract_list_item_occurrence_date(it: Dict[str, Any]) -> Optional[date]:
+    """
+    If the list item represents an occurrence, it may include an occurrence date.
+    """
+    candidates = [
+        it.get("occurrence_date"),
+        it.get("occurrence"),
+        it.get("date"),
+        get_nested(it, "meta", "occurrence_date"),
+        get_nested(it, "meta", "date"),
+        get_nested(it, "data", "occurrence_date"),
+    ]
+    for c in candidates:
+        d = parse_any_date(str_or_empty(c))
+        if d:
+            return d
+    return None
+
+
+# -------------------------
+# Event detail parsing
+# -------------------------
+
+def extract_event_dates(ev: Dict[str, Any]) -> Tuple[date, date]:
+    """
+    Return (start_date, end_date) from event detail. Defaults to today if missing.
+    """
+    today = date.today()
+    sd = parse_any_date(first_nonempty(
+        ev.get("start_date"),
+        ev.get("date_start"),
+        get_nested(ev, "data", "start_date"),
+        get_nested(ev, "mec", "start_date"),
+        get_nested(ev, "meta", "start_date"),
+        get_nested(ev, "dates", "start"),
+    )) or today
+
+    ed = parse_any_date(first_nonempty(
+        ev.get("end_date"),
+        ev.get("date_end"),
+        get_nested(ev, "data", "end_date"),
+        get_nested(ev, "mec", "end_date"),
+        get_nested(ev, "meta", "end_date"),
+        get_nested(ev, "dates", "end"),
+    )) or sd
+
+    return sd, ed
+
+
+def is_all_day(ev: Dict[str, Any]) -> bool:
+    candidates = [
+        ev.get("all_day"),
+        ev.get("allday"),
+        ev.get("allDay"),
+        get_nested(ev, "data", "all_day"),
+        get_nested(ev, "mec", "all_day"),
+        get_nested(ev, "meta", "all_day"),
+    ]
+    return any(truthy(c) for c in candidates)
+
+
+def extract_times(ev: Dict[str, Any]) -> Tuple[str, str]:
+    st = first_nonempty(
+        ev.get("start_time"),
+        ev.get("time_start"),
+        get_nested(ev, "data", "start_time"),
+        get_nested(ev, "mec", "start_time"),
+        get_nested(ev, "meta", "start_time"),
+    )
+    et = first_nonempty(
+        ev.get("end_time"),
+        ev.get("time_end"),
+        get_nested(ev, "data", "end_time"),
+        get_nested(ev, "mec", "end_time"),
+        get_nested(ev, "meta", "end_time"),
+    )
+    return parse_any_time(st), parse_any_time(et)
+
+
+def extract_url(ev: Dict[str, Any]) -> str:
+    return first_nonempty(
+        ev.get("url"),
+        ev.get("permalink"),
+        ev.get("link"),
+        get_nested(ev, "data", "url"),
+        get_nested(ev, "data", "permalink"),
+        get_nested(ev, "meta", "url"),
     )
 
-    text = ""
-    if isinstance(raw, list):
-        text = ", ".join([str(x) for x in raw])
-    else:
-        text = str(raw) if raw is not None else ""
 
-    if not text.strip():
-        text = " ".join([
-            str_or_empty(event.get("title")),
-            str_or_empty(event.get("name")),
-            str_or_empty(event.get("taxonomy")),
-            str_or_empty(get_nested(event, "meta", "taxonomy")),
-        ])
-
-    t = text.lower()
-    medical = "Yes" if "medical" in t else "No"
-    dental = "Yes" if "dental" in t else "No"
-    vision = "Yes" if "vision" in t else "No"
-    dentures = "Yes" if "denture" in t else "No"
-    return medical, dental, vision, dentures
-
-def extract_location(event: Dict[str, Any]) -> Tuple[str, str, str, str, str, str, str, str]:
-    venue = first_non_empty(
-        event.get("venue"),
-        event.get("location"),
-        get_nested(event, "meta", "venue"),
-        get_nested(event, "meta", "location"),
-    )
-    if not isinstance(venue, dict):
-        venue = {}
-
-    lat = first_non_empty(event.get("lat"), venue.get("lat"), venue.get("latitude"), get_nested(event, "meta", "lat"))
-    lng = first_non_empty(event.get("lng"), venue.get("lng"), venue.get("longitude"), get_nested(event, "meta", "lng"))
-
-    address = first_non_empty(
-        event.get("address"),
-        venue.get("address"),
-        venue.get("street"),
-        get_nested(event, "meta", "address"),
-    )
-
-    city = first_non_empty(event.get("city"), venue.get("city"), get_nested(event, "meta", "city"))
-    state = first_non_empty(event.get("state"), venue.get("state"), get_nested(event, "meta", "state"))
-
-    site = first_non_empty(event.get("site"), venue.get("site"), (f"{city}, {state}" if city and state else ""))
-    facility = first_non_empty(event.get("facility"), venue.get("name"), event.get("venue_name"), event.get("title"))
-
-    tel = first_non_empty(
-        event.get("telehealth"),
-        get_nested(event, "meta", "telehealth"),
-        get_nested(event, "meta", "is_telehealth"),
-        event.get("is_telehealth"),
-    )
-    telehealth = "Yes" if (tel is True or (isinstance(tel, str) and tel.strip().lower() in ("1","yes","true","on"))) else "No"
-
-    return (
-        str_or_empty(lat),
-        str_or_empty(lng),
-        str_or_empty(address),
-        str_or_empty(city),
-        str_or_empty(state),
-        str_or_empty(site),
-        str_or_empty(facility),
-        telehealth,
-    )
-
-def extract_url(event: Dict[str, Any]) -> str:
-    return str_or_empty(first_non_empty(event.get("url"), event.get("permalink"), get_nested(event, "meta", "url")))
-
-def extract_canceled(event: Dict[str, Any]) -> str:
-    status = str_or_empty(first_non_empty(event.get("status"), event.get("event_status"), get_nested(event, "meta", "status"))).lower()
+def extract_cancelled(ev: Dict[str, Any]) -> bool:
+    # Try typical status fields
+    status = first_nonempty(
+        ev.get("status"),
+        ev.get("event_status"),
+        get_nested(ev, "data", "status"),
+        get_nested(ev, "meta", "status"),
+    ).lower()
     if "cancel" in status:
-        return "Yes"
-    c = first_non_empty(event.get("canceled"), event.get("cancelled"), get_nested(event, "meta", "canceled"))
-    if c is True or (isinstance(c, str) and c.strip().lower() in ("1","yes","true","on")):
-        return "Yes"
-    return "No"
-
-def extract_parking(event: Dict[str, Any]) -> Tuple[str, str]:
-    pd = first_non_empty(event.get("parking_date"), get_nested(event, "meta", "parking_date"))
-    pt = first_non_empty(event.get("parking_time"), get_nested(event, "meta", "parking_time"))
-    return str_or_empty(pd), str_or_empty(pt)
-
-
-# ----------------------------
-# All-day detection & time extraction
-# ----------------------------
-
-def is_all_day(event: Dict[str, Any]) -> bool:
-    for k in ("all_day", "allDay", "allday"):
-        if event.get(k) is True:
-            return True
-
-    meta = first_non_empty(event.get("meta"), event.get("mec"), {}) or {}
-    if isinstance(meta, dict):
-        for k in ("all_day", "allDay", "allday", "mec_allday", "mec_all_day"):
-            v = meta.get(k)
-            if v is True:
-                return True
-            if isinstance(v, str) and v.strip().lower() in ("1", "true", "yes", "on"):
-                return True
-
+        return True
+    if truthy(ev.get("canceled")) or truthy(ev.get("cancelled")):
+        return True
     return False
 
-def extract_times(event: Dict[str, Any]) -> Tuple[str, str]:
-    st = first_non_empty(
-        event.get("start_time"),
-        get_nested(event, "meta", "start_time"),
-        get_nested(event, "mec", "start_time"),
+
+def extract_location(ev: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Normalize location fields used in your CSV:
+    lat,lng,address,city,state,site,facility,telehealth
+    """
+    # Venue can be a nested object or string
+    venue = get_nested(ev, "venue") or get_nested(ev, "location") or get_nested(ev, "data", "venue") or {}
+    if isinstance(venue, str):
+        venue = {"name": venue}
+
+    lat = first_nonempty(
+        ev.get("lat"), ev.get("latitude"),
+        get_nested(venue, "lat"), get_nested(venue, "latitude"),
+        get_nested(ev, "data", "lat"), get_nested(ev, "data", "latitude"),
     )
-    et = first_non_empty(
-        event.get("end_time"),
-        get_nested(event, "meta", "end_time"),
-        get_nested(event, "mec", "end_time"),
+    lng = first_nonempty(
+        ev.get("lng"), ev.get("lon"), ev.get("longitude"),
+        get_nested(venue, "lng"), get_nested(venue, "lon"), get_nested(venue, "longitude"),
+        get_nested(ev, "data", "lng"), get_nested(ev, "data", "longitude"),
     )
 
-    if not st or not et:
-        sched = first_non_empty(
-            event.get("time"),
-            get_nested(event, "meta", "time"),
-            get_nested(event, "meta", "hourly_schedule"),
-        )
-        if isinstance(sched, str) and "-" in sched:
-            left, right = [x.strip() for x in sched.split("-", 1)]
-            st = st or left
-            et = et or right
+    address = first_nonempty(
+        ev.get("address"),
+        get_nested(venue, "address"),
+        get_nested(ev, "data", "address"),
+        get_nested(ev, "meta", "address"),
+    )
+    city = first_nonempty(
+        ev.get("city"),
+        get_nested(venue, "city"),
+        get_nested(ev, "data", "city"),
+    )
+    state = first_nonempty(
+        ev.get("state"),
+        get_nested(venue, "state"),
+        get_nested(ev, "data", "state"),
+    )
 
-    return normalize_time_str(str_or_empty(st)), normalize_time_str(str_or_empty(et))
+    # "site" appears to be like "East Bend, NC"
+    site = first_nonempty(
+        ev.get("site"),
+        get_nested(ev, "data", "site"),
+        get_nested(ev, "meta", "site"),
+        first_nonempty(city, "").strip() + (", " + state.strip() if city.strip() and state.strip() else ""),
+    )
 
+    # facility name
+    facility = first_nonempty(
+        ev.get("facility"),
+        get_nested(venue, "name"),
+        get_nested(ev, "data", "facility"),
+        get_nested(ev, "meta", "facility"),
+        ev.get("title"),
+        ev.get("post_title"),
+    )
 
-# ----------------------------
-# Occurrence expansion & cleaning
-# ----------------------------
+    telehealth = truthy(first_nonempty(
+        ev.get("telehealth"),
+        get_nested(ev, "data", "telehealth"),
+        get_nested(ev, "meta", "telehealth"),
+    ))
 
-def extract_event_dates(event: Dict[str, Any]) -> Tuple[Optional[date], Optional[date]]:
-    sd = first_non_empty(event.get("start_date"), get_nested(event, "meta", "start_date"), event.get("date_start"))
-    ed = first_non_empty(event.get("end_date"), get_nested(event, "meta", "end_date"), event.get("date_end"))
-
-    d1 = parse_any_date(str_or_empty(sd))
-    d2 = parse_any_date(str_or_empty(ed))
-    return d1, d2
-
-def extract_occurrence_dates(event: Dict[str, Any]) -> List[Tuple[date, date]]:
-    occ = first_non_empty(event.get("occurrences"), get_nested(event, "meta", "occurrences"))
-    out: List[Tuple[date, date]] = []
-
-    if isinstance(occ, list) and occ:
-        for item in occ:
-            if not isinstance(item, dict):
-                continue
-            sd = parse_any_date(str_or_empty(first_non_empty(item.get("start_date"), item.get("start"), item.get("date_start"))))
-            ed = parse_any_date(str_or_empty(first_non_empty(item.get("end_date"), item.get("end"), item.get("date_end"))))
-            if sd and not ed:
-                ed = sd
-            if sd and ed:
-                out.append((sd, ed))
-
-    if not out:
-        sd, ed = extract_event_dates(event)
-        if sd and not ed:
-            ed = sd
-        if sd and ed:
-            out.append((sd, ed))
-
-    return out
-
-def daterange(d1: date, d2: date) -> Iterable[date]:
-    cur = d1
-    while cur <= d2:
-        yield cur
-        cur += timedelta(days=1)
-
-def expand_to_rows(event: Dict[str, Any], cfg: Cfg) -> List[Dict[str, str]]:
-    canceled = extract_canceled(event)
-    lat, lng, address, city, state, site, facility, telehealth = extract_location(event)
-    url = extract_url(event)
-    parking_date, parking_time = extract_parking(event)
-    medical, dental, vision, dentures = parse_services(event)
-
-    all_day = is_all_day(event)
-    start_time, end_time = extract_times(event)
-
-    # RULE: all-day => blank times
-    if all_day:
-        start_time = ""
-        end_time = ""
-
-    rows: List[Dict[str, str]] = []
-    for (sd, ed) in extract_occurrence_dates(event):
-        if (ed - sd).days > cfg.max_span_days:
-            if debug_enabled():
-                log(f"[warn] span too long ({sd} -> {ed}), clamping to {cfg.max_span_days} days for url={url}")
-            ed = sd + timedelta(days=cfg.max_span_days)
-
-        for d in daterange(sd, ed):
-            rows.append({
-                "canceled": canceled,
-                "lat": lat,
-                "lng": lng,
-                "address": address,
-                "city": city,
-                "state": state,
-                "site": site,
-                "facility": facility,
-                "telehealth": telehealth,
-                "start_time": start_time,
-                "end_time": end_time,
-                "start_date": format_date(d, cfg.date_format),
-                "end_date": format_date(d, cfg.date_format),
-                "parking_date": parking_date,
-                "parking_time": parking_time,
-                "medical": medical,
-                "dental": dental,
-                "vision": vision,
-                "dentures": dentures,
-                "url": url,
-                "_all_day": "1" if all_day else "0",
-            })
-
-    return rows
-
-def drop_range_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    if not rows:
-        return rows
-
-    by_url: Dict[str, List[Dict[str, str]]] = {}
-    for r in rows:
-        by_url.setdefault(r.get("url", ""), []).append(r)
-
-    out: List[Dict[str, str]] = []
-    for u, group in by_url.items():
-        if len(group) == 1:
-            out.append(group[0])
-            continue
-
-        def keyfunc(rr: Dict[str, str]) -> Tuple[int, int, int]:
-            d = parse_any_date(rr["start_date"]) or date.min
-            return (d.year, d.month, d.day)
-
-        out.append(max(group, key=keyfunc))
-
-    return out
-
-def collapse_duplicates_by_date(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    def score(r: Dict[str, str]) -> int:
-        return sum(1 for k, v in r.items() if not k.startswith("_") and str(v).strip() != "")
-
-    grouped: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
-    for r in rows:
-        grouped.setdefault((r.get("url", ""), r.get("start_date", "")), []).append(r)
-
-    out: List[Dict[str, str]] = []
-    for group in grouped.values():
-        out.append(max(group, key=score))
-    return out
-
-def enforce_all_day_override(rows: List[Dict[str, str]]) -> None:
-    for r in rows:
-        if r.get("_all_day") == "1":
-            r["start_time"] = ""
-            r["end_time"] = ""
+    return {
+        "lat": lat,
+        "lng": lng,
+        "address": address,
+        "city": city,
+        "state": state,
+        "site": site,
+        "facility": facility,
+        "telehealth": "Yes" if telehealth else "No",
+    }
 
 
-# ----------------------------
-# Main sync logic
-# ----------------------------
+def extract_parking(ev: Dict[str, Any]) -> Tuple[str, str]:
+    pd = first_nonempty(
+        ev.get("parking_date"),
+        get_nested(ev, "data", "parking_date"),
+        get_nested(ev, "meta", "parking_date"),
+    )
+    pt = first_nonempty(
+        ev.get("parking_time"),
+        get_nested(ev, "data", "parking_time"),
+        get_nested(ev, "meta", "parking_time"),
+    )
+    return pd.strip(), pt.strip()
 
-def collect_unique_event_ids(client: MecClient, cfg: Cfg) -> List[int]:
+
+def parse_services(ev: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """
+    Return "Yes"/"No" for (medical, dental, vision, dentures)
+    """
+    # Your logs show a "services_field" sometimes; also sometimes missing and you used taxonomy fallback.
+    services_field = first_nonempty(
+        ev.get("services"),
+        ev.get("services_field"),
+        get_nested(ev, "data", "services"),
+        get_nested(ev, "meta", "services"),
+        get_nested(ev, "acf", "services"),
+        get_nested(ev, "taxonomy"),
+        get_nested(ev, "taxonomies"),
+    )
+
+    blob = str_or_empty(services_field).lower()
+
+    # Taxonomy fallback often embeds words
+    medical = "yes" if "medical" in blob else "no"
+    dental = "yes" if "dental" in blob else "no"
+    vision = "yes" if "vision" in blob else "no"
+    dentures = "yes" if "denture" in blob else "no"
+
+    return (
+        "Yes" if medical == "yes" else "No",
+        "Yes" if dental == "yes" else "No",
+        "Yes" if vision == "yes" else "No",
+        "Yes" if dentures == "yes" else "No",
+    )
+
+
+# -------------------------
+# Pagination + occurrence hints
+# -------------------------
+
+def collect_unique_event_ids_with_hints(client: MecClient, cfg: Cfg) -> Tuple[List[int], Dict[int, List[date]]]:
     start_date = cfg.start
     offset = 0
     seen_pages = set()
 
     unique_ids: List[int] = []
     seen_ids = set()
+    hints: Dict[int, List[date]] = {}
 
     for page in range(1, cfg.max_pages + 1):
         key = (start_date.isoformat(), offset)
@@ -542,107 +628,295 @@ def collect_unique_event_ids(client: MecClient, cfg: Cfg) -> List[int]:
 
         ids_this_page: List[int] = []
         max_date: Optional[date] = None
+        last_id: Optional[int] = None
+        hints_added = 0
 
         for it in items:
-            if not isinstance(it, dict):
-                continue
             eid = it.get("id") or it.get("event_id") or it.get("ID")
             try:
                 eid_int = int(eid)
             except Exception:
                 continue
+
+            last_id = eid_int
             ids_this_page.append(eid_int)
+
             if eid_int not in seen_ids:
                 seen_ids.add(eid_int)
                 unique_ids.append(eid_int)
 
-            d = parse_any_date(str_or_empty(first_non_empty(it.get("start_date"), it.get("date_start"), get_nested(it, "meta", "start_date"))))
+            # occurrence hint
+            occ = extract_list_item_occurrence_date(it) or extract_list_item_start_date(it)
+            if occ:
+                hints.setdefault(eid_int, [])
+                if occ not in hints[eid_int]:
+                    hints[eid_int].append(occ)
+                    hints_added += 1
+
+            d = extract_list_item_start_date(it)
             if d and (max_date is None or d > max_date):
                 max_date = d
 
-        log(f"[mec] list page {page}: start_date={start_date.isoformat()} offset={offset} -> items={len(items)} ids={len(set(ids_this_page))} unique_total={len(unique_ids)}")
+        if debug_enabled():
+            log(
+                f"[mec] list page {page}: start_date={start_date.isoformat()} offset={offset} "
+                f"-> items={len(items)} ids={len(set(ids_this_page))} hints_added={hints_added} unique_total={len(unique_ids)}"
+            )
+        else:
+            log(
+                f"[mec] list page {page}: start_date={start_date.isoformat()} offset={offset} "
+                f"-> items={len(items)} ids={len(set(ids_this_page))} unique_total={len(unique_ids)}"
+            )
 
         if not items:
             break
 
+        # If list items don't include a usable max_date, fetch event detail for the last ID
+        # so we can advance start_date and avoid fragile offset paging on ancient dates.
+        if max_date is None and last_id is not None:
+            try:
+                ev = client.get_event(last_id)
+                ev_sd, _ = extract_event_dates(ev)
+                max_date = ev_sd
+                if debug_enabled():
+                    log(f"[mec] inferred max_date from event detail id={last_id}: {max_date}")
+            except Exception:
+                max_date = None
+
         # advance pagination
-        if max_date is None or max_date <= start_date:
-            offset += len(items)
-        else:
+        if max_date is not None and max_date > start_date:
             start_date = max_date
             offset = 0
+        else:
+            offset += len(items)
 
-    return unique_ids
+        # Safety bump for very old dates if offset paging causes API trouble
+        if start_date <= cfg.start and offset > 0 and len(items) < cfg.limit:
+            start_date = start_date + timedelta(days=1)
+            offset = 0
+            if debug_enabled():
+                log(f"[mec] safety bump: advancing start_date to {start_date} to avoid offset paging on very old start_date")
 
-def write_csv(path: str, rows: List[Dict[str, str]], delimiter: str) -> None:
-    fieldnames = [
-        "canceled","lat","lng","address","city","state","site","facility","telehealth",
-        "start_time","end_time","start_date","end_date","parking_date","parking_time",
-        "medical","dental","vision","dentures","url"
-    ]
+    # Normalize hints list ordering
+    for eid in list(hints.keys()):
+        hints[eid] = sorted(set(hints[eid]))
+
+    return unique_ids, hints
+
+
+# -------------------------
+# Row model + cleaning
+# -------------------------
+
+CSV_HEADERS = [
+    "canceled",
+    "lat",
+    "lng",
+    "address",
+    "city",
+    "state",
+    "site",
+    "facility",
+    "telehealth",
+    "start_time",
+    "end_time",
+    "start_date",
+    "end_date",
+    "parking_date",
+    "parking_time",
+    "medical",
+    "dental",
+    "vision",
+    "dentures",
+    "url",
+]
+
+
+def row_quality_score(r: Dict[str, str]) -> int:
+    """
+    Used for collapsing duplicates by date: keep the most informative row.
+    """
+    score = 0
+    for k in ("start_time", "end_time", "address", "facility", "url"):
+        if str_or_empty(r.get(k)).strip():
+            score += 1
+    for k in ("medical", "dental", "vision", "dentures"):
+        if r.get(k) == "Yes":
+            score += 1
+    return score
+
+
+def drop_range_rows(rows: List[Dict[str, str]], all_day_flag: bool) -> List[Dict[str, str]]:
+    """
+    If an event spans multiple days and is all-day, your desired behavior is a SINGLE row.
+    We keep the row whose start_date=end_date=end_date (i.e., end day).
+    """
+    if not rows:
+        return rows
+    if not all_day_flag:
+        return rows
+
+    # If any rows have differing start/end, keep only the one on the latest date.
+    # (Assumes rows are single-day rows already.)
+    def row_date(r: Dict[str, str]) -> Optional[date]:
+        return parse_any_date(r.get("start_date", ""))
+
+    dated = [(row_date(r), r) for r in rows]
+    dated = [(d, r) for (d, r) in dated if d is not None]
+    if not dated:
+        return rows
+    latest = max(dated, key=lambda x: x[0])[1]
+    return [latest]
+
+
+def collapse_duplicates_by_date(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Keep one row per (start_date) within an event.
+    """
+    best: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        key = str_or_empty(r.get("start_date")).strip()
+        if not key:
+            continue
+        if key not in best or row_quality_score(r) > row_quality_score(best[key]):
+            best[key] = r
+    # preserve date order
+    out = [best[k] for k in sorted(best.keys(), key=lambda s: parse_any_date(s) or date(1900, 1, 1))]
+    return out
+
+
+# -------------------------
+# Build rows from an event
+# -------------------------
+
+def build_rows_for_event(ev: Dict[str, Any], cfg: Cfg, occurrence_hints: Optional[List[date]] = None) -> List[Dict[str, str]]:
+    cancelled = extract_cancelled(ev)
+    loc = extract_location(ev)
+    parking_date, parking_time = extract_parking(ev)
+    medical, dental, vision, dentures = parse_services(ev)
+    url = extract_url(ev)
+
+    sd, ed = extract_event_dates(ev)
+    all_day_flag = is_all_day(ev)
+
+    start_time, end_time = extract_times(ev)
+    if all_day_flag:
+        # your requirement: if "All-day Event" is checked, leave times blank
+        start_time, end_time = "", ""
+
+    # If event is multi-day and all-day, collapse to one row on end date
+    if all_day_flag and sd != ed:
+        sd = ed
+
+    rows: List[Dict[str, str]] = []
+
+    def make_row(d: date) -> Dict[str, str]:
+        return {
+            "canceled": "Yes" if cancelled else "No",
+            "lat": loc["lat"],
+            "lng": loc["lng"],
+            "address": loc["address"],
+            "city": loc["city"],
+            "state": loc["state"],
+            "site": loc["site"],
+            "facility": loc["facility"],
+            "telehealth": loc["telehealth"],
+            "start_time": start_time,
+            "end_time": end_time,
+            "start_date": format_date(d, cfg.date_format),
+            "end_date": format_date(d, cfg.date_format),
+            "parking_date": parking_date,
+            "parking_time": parking_time,
+            "medical": medical,
+            "dental": dental,
+            "vision": vision,
+            "dentures": dentures,
+            "url": url,
+        }
+
+    if occurrence_hints:
+        # one row per occurrence date
+        for d in sorted(set(occurrence_hints)):
+            # keep within global window
+            if d < cfg.start or d > cfg.end:
+                continue
+            rows.append(make_row(d))
+    else:
+        # one row based on sd/ed (already collapsed for all-day multi-day)
+        if sd < cfg.start or sd > cfg.end:
+            return []
+        rows.append(make_row(sd))
+
+    # Clean: drop range rows (defensive), then collapse duplicates by date
+    before = len(rows)
+    rows = drop_range_rows(rows, all_day_flag=all_day_flag)
+    if debug_enabled() and len(rows) != before:
+        log(f"[clean] dropped range rows: {before} -> {len(rows)}")
+
+    before = len(rows)
+    rows = collapse_duplicates_by_date(rows)
+    if debug_enabled() and len(rows) != before:
+        log(f"[clean] collapsed duplicates by date: {before} -> {len(rows)}")
+
+    return rows
+
+
+# -------------------------
+# CSV write
+# -------------------------
+
+def write_csv(path: str, delimiter: str, rows: Iterable[Dict[str, str]]) -> int:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    count = 0
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, delimiter=delimiter)
+        w = csv.DictWriter(f, fieldnames=CSV_HEADERS, delimiter=delimiter, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
+            w.writerow(r)
+            count += 1
+    return count
+
+
+# -------------------------
+# Main
+# -------------------------
 
 def main() -> int:
-    cfg = Cfg(
-        base_url=env("MEC_BASE_URL"),
-        token=os.getenv("MEC_TOKEN", ""),
-        csv_path=env("CSV_PATH"),
-        start=parse_iso_date(os.getenv("MEC_START", "2010-01-01")),
-        end=parse_iso_date(os.getenv("MEC_END", "2030-12-31")),
-        limit=int(os.getenv("MEC_LIMIT", "200")),
-        max_pages=int(os.getenv("MAX_PAGES", "50")),
-        max_span_days=int(os.getenv("MAX_SPAN_DAYS", "10")),
-        csv_delimiter=delimiter_from_env(os.getenv("CSV_DELIMITER", "comma")),
-        date_format=os.getenv("DATE_FORMAT", "mdy").strip().lower(),
-    )
-
-    log(f"[cfg] base_url={cfg.base_url}")
-    log(f"[cfg] start={cfg.start.isoformat()} end={cfg.end.isoformat()} limit={cfg.limit} max_pages={cfg.max_pages} max_span_days={cfg.max_span_days}")
-    log(f"[cfg] include_past={1 if cfg.include_past else 0} include_ongoing={1 if cfg.include_ongoing else 0}")
-    log(f"[cfg] csv_path={cfg.csv_path} delimiter=COMMA date_format={cfg.date_format}")
-
+    cfg = load_cfg()
     client = MecClient(cfg)
 
-    ids = collect_unique_event_ids(client, cfg)
-    log(f"[mec] Total unique event IDs: {len(ids)}")
+    ids, hints = collect_unique_event_ids_with_hints(client, cfg)
+    log(f"[mec] Total unique event IDs: {len(ids)} (with occurrence hints for {len(hints)})")
 
     all_rows: List[Dict[str, str]] = []
     skipped_404 = 0
 
     for eid in ids:
         try:
-            event = client.get_event(eid)
+            ev = client.get_event(eid)
         except requests.HTTPError as e:
+            # If a missing event appears, skip it.
             if getattr(e.response, "status_code", None) == 404:
                 skipped_404 += 1
                 continue
             raise
 
-        rows = expand_to_rows(event, cfg)
-
-        before = len(rows)
-        rows = drop_range_rows(rows)
-        if debug_enabled():
-            log(f"[clean] dropped range rows: {before} -> {len(rows)}")
-
-        before = len(rows)
-        rows = collapse_duplicates_by_date(rows)
-        if debug_enabled():
-            log(f"[clean] collapsed duplicates by date: {before} -> {len(rows)}")
-
-        enforce_all_day_override(rows)
+        # Build rows. If we have hints for this event, use them.
+        occ = hints.get(eid)
+        rows = build_rows_for_event(ev, cfg, occurrence_hints=occ)
         all_rows.extend(rows)
 
-    all_rows = collapse_duplicates_by_date(all_rows)
-    enforce_all_day_override(all_rows)
+    # Sort output by start_date (parsed)
+    def sort_key(r: Dict[str, str]) -> Tuple[date, str]:
+        d = parse_any_date(r.get("start_date", "")) or date(1900, 1, 1)
+        return (d, r.get("site", ""))
 
-    write_csv(cfg.csv_path, all_rows, cfg.csv_delimiter)
-    log(f"Wrote {len(all_rows)} rows to {cfg.csv_path} (skipped_404={skipped_404})")
+    all_rows.sort(key=sort_key)
+
+    count = write_csv(cfg.csv_path, cfg.delimiter, all_rows)
+    log(f"Wrote {count} rows to {cfg.csv_path} (skipped_404={skipped_404})")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
