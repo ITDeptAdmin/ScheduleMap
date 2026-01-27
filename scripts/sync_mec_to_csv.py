@@ -10,8 +10,7 @@ Fixes included in this version:
 - Extracts occurrences robustly:
     * Builds per-occurrence hints from the /events list response (deep-scans each list item for start/end blocks).
     * Falls back to scanning the event detail payload for occurrences.
-- Per-event row cleanup to eliminate duplicates and bad "range" rows:
-    * If any single-day rows exist, drop multi-day range rows for that event.
+- Per-event row cleanup to eliminate duplicates:
     * For duplicates on same date(s), keep the row that contains times (prefer timeful over timeless).
 - Writes comma CSV by default (set CSV_DELIMITER=tab for TSV).
 
@@ -21,6 +20,10 @@ NEW in this version:
 - Optionally forces POPUP clinics (telehealth=No) to be treated as all-day (blank times),
   because your UI doesn’t want to show 8:00 AM–6:00 PM for popup clinics.
   Control with env var POPUP_ALLDAY (default: 1).
+- IMPORTANT: Popup clinics are now collapsed into ONE row per event with a date span:
+    start_date = earliest occurrence date
+    end_date   = latest occurrence date
+  (This makes your sidebar show correct ranges and your calendar expansion work properly.)
 
 Required env vars:
 - MEC_BASE_URL  e.g. https://www.ramusa.org/wp-json/mec/v1.0
@@ -582,6 +585,36 @@ def _occ_to_row_dates_times(occ: Dict[str, Any], cfg: Cfg, *, force_all_day: boo
     }
 
 
+def _collapse_occurrences_to_span(occs: List[Dict[str, Any]]) -> Tuple[str, str]:
+    """
+    Return (min_start_ymd, max_end_ymd) across occurrences.
+    Works for MEC patterns where multi-day events are represented as multiple single-day occurrences.
+    """
+    starts: List[str] = []
+    ends: List[str] = []
+
+    for occ in occs:
+        s_obj = occ.get("start") or {}
+        e_obj = occ.get("end") or {}
+
+        s_date = str(s_obj.get("date") or "").strip()
+        e_date = str(e_obj.get("date") or s_date or "").strip()
+
+        if s_date and _YMD_RE.match(s_date):
+            starts.append(s_date)
+        if e_date and _YMD_RE.match(e_date):
+            ends.append(e_date)
+
+    if not starts and not ends:
+        return ("", "")
+    if not starts:
+        starts = ends[:]
+    if not ends:
+        ends = starts[:]
+
+    return (min(starts), max(ends))
+
+
 def _ymd_in_range(d: str, start: str, end: str) -> bool:
     dd = _parse_ymd(d)
     if not dd:
@@ -746,11 +779,8 @@ def _iter_all_occurrences(cfg: Cfg, sess: requests.Session) -> Tuple[Set[int], D
 
 def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[str, str]]:
     """
-    1) If the event has ANY single-day rows (start_ymd == end_ymd),
-       drop all multi-day rows for that event.
-
-    2) Collapse duplicates for the same date(s):
-       keep the row that has times (prefer timeful over timeless).
+    Collapse duplicates for the same date(s), preferring the row that has times.
+    (We DO NOT drop range rows anymore; popup clinics are intentionally written as a single ranged row.)
     """
     if not rows:
         return rows
@@ -758,14 +788,6 @@ def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[s
     def has_time(r: Dict[str, str]) -> bool:
         return bool((r.get("start_time") or "").strip() or (r.get("end_time") or "").strip())
 
-    # 1) drop range rows when daily rows exist
-    daily_exists = any((r.get("_start_ymd") or "") and (r.get("_start_ymd") == r.get("_end_ymd")) for r in rows)
-    if daily_exists:
-        before = len(rows)
-        rows = [r for r in rows if (r.get("_start_ymd") == r.get("_end_ymd"))]
-        _debug(cfg, f"[clean] dropped range rows: {before} -> {len(rows)}")
-
-    # 2) collapse timeless duplicates, preferring timeful
     best: Dict[Tuple[str, str, str, str, str], Dict[str, str]] = {}
     for r in rows:
         key = (
@@ -837,10 +859,16 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         occs = [{"start": {"date": ""}, "end": {"date": ""}, "allday": "1", "hide_time": "1"}]
 
     rows: List[Dict[str, str]] = []
-    for occ in occs:
-        # Force popup clinics to be "all day" (blank times) if POPUP_ALLDAY=1
-        force_all_day = (cfg.popup_allday and not is_telehealth)
-        dt = _occ_to_row_dates_times(occ, cfg, force_all_day=force_all_day)
+
+    # ✅ Popup clinics: write ONE row with a date range spanning all occurrences
+    if not is_telehealth:
+        span_start_ymd, span_end_ymd = _collapse_occurrences_to_span(occs)
+
+        # If MEC didn't give usable dates, fall back to the first occurrence conversion
+        if not span_start_ymd:
+            dt0 = _occ_to_row_dates_times(occs[0], cfg, force_all_day=True)
+            span_start_ymd = dt0.get("_start_ymd", "") or ""
+            span_end_ymd = dt0.get("_end_ymd", "") or span_start_ymd
 
         row: Dict[str, str] = {h: "" for h in DEFAULT_HEADER}
         row["canceled"] = _yn(canceled)
@@ -857,10 +885,12 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         row["clinic_type"] = clinic_type_label
         row["telehealth"] = _yn(is_telehealth)
 
-        row["start_time"] = dt["start_time"]
-        row["end_time"] = dt["end_time"]
-        row["start_date"] = dt["start_date"]
-        row["end_date"] = dt["end_date"]
+        # Popup clinics: blank times (allday)
+        row["start_time"] = ""
+        row["end_time"] = ""
+
+        row["start_date"] = _format_date(span_start_ymd, cfg.date_format)
+        row["end_date"] = _format_date(span_end_ymd or span_start_ymd, cfg.date_format)
 
         row["parking_date"] = parking_date
         row["parking_time"] = parking_time
@@ -872,12 +902,55 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         row["url"] = url
 
         # internal fields used for cleanup/dedupe
-        row["_start_ymd"] = dt["_start_ymd"]
-        row["_end_ymd"] = dt["_end_ymd"]
+        row["_start_ymd"] = span_start_ymd
+        row["_end_ymd"] = span_end_ymd or span_start_ymd
         row["_title"] = event_title
-        row["_is_all_day"] = dt["_is_all_day"]
+        row["_is_all_day"] = "1"
 
         rows.append(row)
+
+    else:
+        # Telehealth: keep per-occurrence rows (time-specific)
+        for occ in occs:
+            force_all_day = False  # keep times if present
+            dt = _occ_to_row_dates_times(occ, cfg, force_all_day=force_all_day)
+
+            row: Dict[str, str] = {h: "" for h in DEFAULT_HEADER}
+            row["canceled"] = _yn(canceled)
+            row["lat"] = loc["lat"]
+            row["lng"] = loc["lng"]
+            row["address"] = loc["address"]
+            row["city"] = loc["city"]
+            row["state"] = loc["state"]
+            row["site"] = _safe_site(loc["city"], loc["state"])
+
+            row["title"] = display_title
+            row["facility"] = loc["facility"].strip() or display_title
+
+            row["clinic_type"] = clinic_type_label
+            row["telehealth"] = _yn(is_telehealth)
+
+            row["start_time"] = dt["start_time"]
+            row["end_time"] = dt["end_time"]
+            row["start_date"] = dt["start_date"]
+            row["end_date"] = dt["end_date"]
+
+            row["parking_date"] = parking_date
+            row["parking_time"] = parking_time
+
+            row["medical"] = _yn(svc["medical"])
+            row["dental"] = _yn(svc["dental"])
+            row["vision"] = _yn(svc["vision"])
+            row["dentures"] = _yn(svc["dentures"])
+            row["url"] = url
+
+            # internal fields used for cleanup/dedupe
+            row["_start_ymd"] = dt["_start_ymd"]
+            row["_end_ymd"] = dt["_end_ymd"]
+            row["_title"] = event_title
+            row["_is_all_day"] = dt["_is_all_day"]
+
+            rows.append(row)
 
     rows = _postprocess_event_rows(rows, cfg)
     return rows
