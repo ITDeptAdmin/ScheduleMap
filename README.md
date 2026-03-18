@@ -1,4 +1,23 @@
-# RAM Schedule Map System
+# RAM Schedule Map System (Summary)
+![RAM Impact Map](images/Remote_Area_Medical_Schedule_Map.jpg)
+
+Interactive mapping and scheduling system used on the Remote Area Medical website to display upcoming clinics.
+
+The system connects WordPress event data from Modern Events Calendar (MEC) with a GitHub-hosted dataset that is loaded by a custom WordPress plugin to render an interactive Mapbox-based interface.
+
+Visitors can explore clinics through map, list, and calendar views while filtering by state, month, clinic type, and services.
+
+## Technologies
+- WordPress
+- Modern Events Calendar (MEC)
+- Mapbox
+- GitHub-hosted CSV dataset
+- GitHub Actions automation
+- JavaScript (Papa Parse)
+- Google Analytics 4
+- Looker Studio dashboards
+- 
+# RAM Schedule Map System (Deep Dive)
 
 This repository and plugin setup power the **RAM Schedule Map** used on the RAM website to display **upcoming clinics** in both map and calendar views.
 
