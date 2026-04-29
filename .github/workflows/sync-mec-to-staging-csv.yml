@@ -1,4 +1,4 @@
-name: Sync MEC events to MAIN schedule CSV
+name: Sync MEC events from Staging to MAIN schedule CSV
 
 on:
   workflow_dispatch: {}
