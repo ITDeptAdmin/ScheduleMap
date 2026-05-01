@@ -1,25 +1,45 @@
-name: Sync MEC events to MAIN schedule CSV
+name: Sync MEC events to STAGING schedule CSV
 
 on:
-  workflow_dispatch: {}
-  schedule:
-    - cron: "*/30 * * * *" # every 30 minutes
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: generate CSV but do not commit or push"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: write
 
 concurrency:
-  group: sync-mec-to-csv
+  group: staging-csv-sync
   cancel-in-progress: true
 
 jobs:
-  sync:
+  sync-staging:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout staging branch
         uses: actions/checkout@v4
         with:
+          ref: staging
           fetch-depth: 0
+
+      - name: Verify staging branch
+        shell: bash
+        run: |
+          CURRENT_BRANCH="$(git branch --show-current)"
+          echo "Current branch: $CURRENT_BRANCH"
+
+          if [ "$CURRENT_BRANCH" != "staging" ]; then
+            echo "ERROR: Expected staging branch. Refusing to continue."
+            exit 1
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -31,17 +51,59 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Show MEC host
+      - name: Check staging MEC secrets
+        shell: bash
+        env:
+          MEC_STAGING_BASE_URL: ${{ secrets.MEC_STAGING_BASE_URL }}
+          MEC_STAGING_TOKEN: ${{ secrets.MEC_STAGING_TOKEN }}
+        run: |
+          if [ -z "$MEC_STAGING_BASE_URL" ]; then
+            echo "ERROR: MEC_STAGING_BASE_URL secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$MEC_STAGING_TOKEN" ]; then
+            echo "ERROR: MEC_STAGING_TOKEN secret is missing."
+            exit 1
+          fi
+
+          echo "Staging MEC base URL and token are configured."
+
+      - name: Show MEC host and debug target event
         env:
           MEC_BASE_URL: ${{ secrets.MEC_STAGING_BASE_URL }}
+          MEC_TOKEN: ${{ secrets.MEC_STAGING_TOKEN }}
+          TARGET_EVENT_ID: "25315"
         run: |
           python - <<'PY'
           import os
+          import requests
           from urllib.parse import urlparse
-          host = urlparse(os.environ["MEC_BASE_URL"]).netloc
-          print(f"[debug] MEC host: {host}")
+
+          base = os.environ["MEC_BASE_URL"].rstrip("/")
+          token = os.environ["MEC_TOKEN"]
+          event_id = os.environ["TARGET_EVENT_ID"]
+
+          print("[debug] MEC host:", urlparse(base).netloc)
+
+          url = f"{base}/events/{event_id}"
+          r = requests.get(url, headers={"mec-token": token}, timeout=60)
+
+          print(f"[target] GET /events/{event_id} -> {r.status_code}")
+
+          if r.status_code == 200:
+              payload = r.json()
+              data = payload.get("data", {}) if isinstance(payload, dict) else {}
+              print("[target] title:", data.get("title"))
+              print("[target] permalink:", data.get("permalink"))
+              print("[target] status:", data.get("status") or data.get("post_status") or data.get("event_status"))
+              print("[target] date keys:", list((data.get("date") or {}).keys()) if isinstance(data.get("date"), dict) else "no date block")
+              print("[target] location keys:", list((data.get("locations") or {}).keys()) if isinstance(data.get("locations"), dict) else "no locations")
+          else:
+              print("[target] body:", r.text[:500])
           PY
-      - name: Build CSV from MEC
+
+      - name: Build CSV from staging MEC
         env:
           MEC_BASE_URL: ${{ secrets.MEC_STAGING_BASE_URL }}
           MEC_TOKEN: ${{ secrets.MEC_STAGING_TOKEN }}
@@ -52,20 +114,49 @@ jobs:
           MEC_LIMIT: "200"
           MAX_PAGES: "50"
           MAX_SPAN_DAYS: "10"
-          CSV_DELIMITER: "comma"   # IMPORTANT: your schedule JS expects commas
+          CSV_DELIMITER: "comma"
           DATE_FORMAT: "mdy"
+          POPUP_ALLDAY: "1"
           MEC_DEBUG: "1"
         run: |
           python scripts/sync_mec_to_csv.py
 
-      - name: Commit changes if any
+      - name: Show CSV diff
+        shell: bash
         run: |
-          if git diff --quiet; then
-            echo "No changes."
+          git status --short
+          git diff --stat -- "Clinic Master Schedule for git.csv" || true
+          git diff -- "Clinic Master Schedule for git.csv" | head -n 200 || true
+
+      - name: Stop before commit during dry run
+        if: ${{ inputs.dry_run == 'true' }}
+        run: |
+          echo "Dry run enabled. CSV was generated but will not be committed or pushed."
+
+      - name: Final branch safety check before push
+        if: ${{ inputs.dry_run == 'false' }}
+        shell: bash
+        run: |
+          CURRENT_BRANCH="$(git branch --show-current)"
+          echo "Current branch before push: $CURRENT_BRANCH"
+
+          if [ "$CURRENT_BRANCH" != "staging" ]; then
+            echo "ERROR: Not on staging branch. Refusing to push."
+            exit 1
+          fi
+
+      - name: Commit staging CSV changes if any
+        if: ${{ inputs.dry_run == 'false' }}
+        shell: bash
+        run: |
+          if git diff --quiet -- "Clinic Master Schedule for git.csv"; then
+            echo "No CSV changes."
             exit 0
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Sync MEC events -> MAIN schedule CSV"
-          git push
+
+          git add "Clinic Master Schedule for git.csv"
+          git commit -m "Sync MEC events -> STAGING schedule CSV"
+          git push origin HEAD:staging
