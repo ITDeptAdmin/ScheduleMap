@@ -31,10 +31,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Show MEC host
+        env:
+          MEC_BASE_URL: ${{ secrets.MEC_STAGING_BASE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          host = urlparse(os.environ["MEC_BASE_URL"]).netloc
+          print(f"[debug] MEC host: {host}")
+          PY
       - name: Build CSV from MEC
         env:
-          MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
-          MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
+          MEC_BASE_URL: ${{ secrets.MEC_STAGING_BASE_URL }}
+          MEC_TOKEN: ${{ secrets.MEC_STAGING_TOKEN }}
           CSV_PATH: "Clinic Master Schedule for git.csv"
           MEC_WINDOW_DAYS: "365"
           MEC_START: "2010-01-01"
