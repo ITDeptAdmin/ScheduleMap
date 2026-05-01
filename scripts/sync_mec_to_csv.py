@@ -453,7 +453,7 @@ def _extract_occurrences_from_detail(
     occs_raw: List[Dict[str, Any]] = []
     long_span_count = 0
 
-   _data = detail.get("data", {})
+    _data = detail.get("data", {})
     eid = (_data.get("ID") or _data.get("id")) if isinstance(_data, dict) else None
 
     # Prefer explicit MEC/RAM custom dates before generic start/end blocks.
