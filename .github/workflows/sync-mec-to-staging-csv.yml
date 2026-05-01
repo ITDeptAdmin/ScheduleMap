@@ -77,6 +77,7 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import json
           import requests
           from urllib.parse import urlparse
 
@@ -91,18 +92,73 @@ jobs:
 
           print(f"[target] GET /events/{event_id} -> {r.status_code}")
 
-          if r.status_code == 200:
-              payload = r.json()
-              data = payload.get("data", {}) if isinstance(payload, dict) else {}
-              print("[target] title:", data.get("title"))
-              print("[target] permalink:", data.get("permalink"))
-              print("[target] status:", data.get("status") or data.get("post_status") or data.get("event_status"))
-              print("[target] date keys:", list((data.get("date") or {}).keys()) if isinstance(data.get("date"), dict) else "no date block")
-              print("[target] location keys:", list((data.get("locations") or {}).keys()) if isinstance(data.get("locations"), dict) else "no locations")
-          else:
+          if r.status_code != 200:
               print("[target] body:", r.text[:500])
-          PY
+              raise SystemExit(0)
 
+          payload = r.json()
+          data = payload.get("data", {}) if isinstance(payload, dict) else {}
+
+          print("[target] title:", data.get("title"))
+          print("[target] permalink:", data.get("permalink"))
+          print("[target] status:", data.get("status") or data.get("post_status") or data.get("event_status"))
+          print("[target] data keys:", list(data.keys()))
+          print("[target] date keys:", list((data.get("date") or {}).keys()) if isinstance(data.get("date"), dict) else "no date block")
+          print("[target] location keys:", list((data.get("locations") or {}).keys()) if isinstance(data.get("locations"), dict) else "no locations")
+
+          wanted_words = (
+              "date", "dates", "day", "days", "repeat", "repeating",
+              "occurrence", "occurrences", "start", "end", "time",
+              "mec_start", "mec_end", "mec_repeat"
+          )
+
+          wanted_values = (
+              "2026-06-17", "2026-06-24",
+              "2026-07-15", "2026-07-22",
+              "2026-08-19", "2026-08-26",
+              "06/17", "6/17", "06/24", "6/24",
+              "07/15", "7/15", "07/22", "7/22",
+              "08/19", "8/19", "08/26", "8/26"
+          )
+
+          matches = []
+
+          def walk(obj, path="root"):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      key_text = str(k).lower()
+                      next_path = f"{path}.{k}"
+
+                      if any(word in key_text for word in wanted_words):
+                          matches.append((next_path, v))
+
+                      walk(v, next_path)
+
+              elif isinstance(obj, list):
+                  for i, v in enumerate(obj):
+                      walk(v, f"{path}[{i}]")
+
+              else:
+                  text = str(obj)
+                  if any(val in text for val in wanted_values):
+                      matches.append((path, obj))
+
+          walk(payload)
+
+          print("[target] date-related matches:", len(matches))
+
+          for path, value in matches[:80]:
+              try:
+                  compact = json.dumps(value, ensure_ascii=False)
+              except Exception:
+                  compact = str(value)
+              if len(compact) > 300:
+                  compact = compact[:300] + "..."
+              print(f"[target-path] {path} = {compact}")
+
+          if len(matches) > 80:
+              print(f"[target] showing first 80 of {len(matches)} date-related matches")
+          PY
       - name: Build CSV from staging MEC
         env:
           MEC_BASE_URL: ${{ secrets.MEC_STAGING_BASE_URL }}
