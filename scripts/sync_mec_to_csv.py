@@ -453,8 +453,17 @@ def _extract_occurrences_from_detail(
     occs_raw: List[Dict[str, Any]] = []
     long_span_count = 0
 
-    _data = detail.get("data", {})
+   _data = detail.get("data", {})
     eid = (_data.get("ID") or _data.get("id")) if isinstance(_data, dict) else None
+
+    # Prefer explicit MEC/RAM custom dates before generic start/end blocks.
+    # Some MEC detail payloads expose only one mec_date block first, while the
+    # real telehealth schedule lives in meta._ram_telehealth_mec_in_days.
+    explicit_custom = _extract_mec_repeat_dates(detail, cfg=cfg)
+    if len(explicit_custom) > 1:
+        if cfg and cfg.debug:
+            _debug(cfg, f"[mec_debug] Using {len(explicit_custom)} explicit MEC meta/custom dates for Event ID {eid}")
+        return explicit_custom
 
     for b in _find_occurrence_blocks_anywhere(detail):
         s_obj = b.get("start") or {}
