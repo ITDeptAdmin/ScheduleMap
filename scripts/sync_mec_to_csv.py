@@ -689,7 +689,7 @@ def _extract_mec_repeat_dates(detail: Dict[str, Any], cfg: Optional[Cfg] = None)
     end_minutes = date_block.get("end_minutes") or minutes
     end_ampm    = date_block.get("end_ampm") or ampm
 
-       meta = data.get("meta") or {}
+    meta = data.get("meta") or {}
     if not isinstance(meta, dict):
         meta = {}
 
