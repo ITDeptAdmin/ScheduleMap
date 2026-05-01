@@ -482,7 +482,7 @@ def _extract_occurrences_from_detail(
 
     # If only long-span blocks were found, try explicit custom dates before giving up
     if not occs_raw and long_span_count > 0:
-        custom = _extract_mec_repeat_dates(detail)
+        custom = _extract_mec_repeat_dates(detail, cfg=cfg)
         if custom:
             if cfg and cfg.debug:
                 _debug(cfg, f"[mec_debug] Using {len(custom)} detail/custom dates for Event ID {eid}")
@@ -664,9 +664,15 @@ def _collect_ymd_arrays(obj: Any) -> List[List[str]]:
                 if isinstance(v, (dict, list)):
                     stack.append(v)
     return results
+def _parse_mec_time_token(tok: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse MEC time token like '09-00-AM' into (hour, minutes, ampm)."""
+    m = re.match(r"^(\d{1,2})-(\d{2})-(AM|PM)$", (tok or "").strip(), re.IGNORECASE)
+    if not m:
+        return (None, None, None)
 
+    return (m.group(1), m.group(2), m.group(3).upper())
 
-def _extract_mec_repeat_dates(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_mec_repeat_dates(detail: Dict[str, Any], cfg: Optional[Cfg] = None) -> List[Dict[str, Any]]:
     """Extract explicit custom/repeat dates from MEC's data.date.days structure and related fields."""
     data = detail.get("data", {})
     if not isinstance(data, dict):
@@ -683,6 +689,98 @@ def _extract_mec_repeat_dates(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
     end_minutes = date_block.get("end_minutes") or minutes
     end_ampm    = date_block.get("end_ampm") or ampm
 
+       meta = data.get("meta") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    eid_log = data.get("ID") or data.get("id")
+
+    meta_raw = ""
+    meta_field_name = ""
+
+    ram_meta_days = str(meta.get("_ram_telehealth_mec_in_days") or "").strip()
+    mec_meta_days = str(meta.get("mec_in_days") or "").strip()
+
+    if ram_meta_days:
+        meta_raw = ram_meta_days
+        meta_field_name = "_ram_telehealth_mec_in_days"
+    elif mec_meta_days:
+        meta_raw = mec_meta_days
+        meta_field_name = "mec_in_days"
+
+    range_start = str(meta.get("_ram_mec_start_date") or meta.get("mec_start_date") or "").strip()
+    range_end = str(meta.get("_ram_mec_end_date") or meta.get("mec_end_date") or "").strip()
+    has_range_filter = bool(_parse_ymd(range_start) and _parse_ymd(range_end))
+
+    if meta_raw:
+        meta_occs: List[Dict[str, Any]] = []
+        seen_meta: Set[Tuple[str, str, str, str, str, str, str]] = set()
+
+        for entry in meta_raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+
+            parts = entry.split(":")
+            if len(parts) < 2:
+                continue
+
+            s_date = parts[0].strip()
+            e_date = parts[1].strip()
+
+            if not _YMD_RE.match(s_date):
+                continue
+
+            if not e_date or not _YMD_RE.match(e_date):
+                e_date = s_date
+
+            if has_range_filter and not _ymd_in_range(s_date, range_start, range_end):
+                continue
+
+            s_h, s_m, s_ap = _parse_mec_time_token(parts[2]) if len(parts) >= 3 else (None, None, None)
+            e_h, e_m, e_ap = _parse_mec_time_token(parts[3]) if len(parts) >= 4 else (None, None, None)
+
+            dedup_key = (
+                s_date,
+                e_date,
+                s_h or "",
+                s_m or "",
+                s_ap or "",
+                e_h or "",
+                e_m or "",
+            )
+
+            if dedup_key in seen_meta:
+                continue
+
+            seen_meta.add(dedup_key)
+
+            s_obj: Dict[str, Any] = {"date": s_date}
+            e_obj: Dict[str, Any] = {"date": e_date}
+
+            if s_h is not None:
+                s_obj.update({"hour": s_h, "minutes": s_m, "ampm": s_ap})
+
+            if e_h is not None:
+                e_obj.update({"hour": e_h, "minutes": e_m, "ampm": e_ap})
+
+            has_time = s_h is not None
+
+            meta_occs.append({
+                "start": s_obj,
+                "end": e_obj,
+                "allday": "0" if has_time else "1",
+                "hide_time": "0" if has_time else "1",
+            })
+
+        if meta_occs:
+            if cfg and cfg.debug:
+                msg = f"[mec_debug] Using {len(meta_occs)} meta custom dates for Event ID {eid_log} from {meta_field_name}"
+                if has_range_filter:
+                    msg += f" within {range_start} -> {range_end}"
+                _debug(cfg, msg)
+            return meta_occs
+           
     candidate_dates: List[str] = []
 
     # 1) data.date.days — keys or nested dicts may hold YYYY-MM-DD dates
@@ -984,7 +1082,7 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
     if occ_hints:
         # For telehealth: if all hints are long-span, try explicit custom dates instead
         if is_telehealth and all(_occ_is_long_span(h, cfg.max_span_days) for h in occ_hints):
-            custom = _extract_mec_repeat_dates(detail)
+            custom = _extract_mec_repeat_dates(detail, cfg=cfg)
             if custom:
                 if cfg.debug:
                     _debug(cfg, f"[mec_debug] Using {len(custom)} detail/custom dates for Event ID {eid}")
@@ -1203,6 +1301,29 @@ def main() -> None:
 
     event_ids, occ_map = _iter_all_occurrences(cfg, sess)
     _debug(cfg, f"[mec] Total unique event IDs: {len(event_ids)} (with occurrence hints for {len(occ_map)})")
+
+    extra_ids_raw = (os.environ.get("EXTRA_EVENT_IDS", "") or "").strip()
+    if extra_ids_raw:
+        added_extra_ids: List[str] = []
+
+        for raw_id in extra_ids_raw.split(","):
+            raw_id = raw_id.strip()
+            if not raw_id:
+                continue
+
+            try:
+                extra_eid = int(raw_id)
+            except ValueError:
+                if cfg.debug:
+                    _debug(cfg, f"[mec_debug] Ignoring invalid EXTRA_EVENT_IDS value: {raw_id}")
+                continue
+
+            if extra_eid not in event_ids:
+                event_ids.add(extra_eid)
+                added_extra_ids.append(str(extra_eid))
+
+        if added_extra_ids and cfg.debug:
+            _debug(cfg, f"[mec_debug] Added EXTRA_EVENT_IDS: {', '.join(added_extra_ids)}")
 
     all_rows: List[Dict[str, str]] = []
     skipped_404 = 0
