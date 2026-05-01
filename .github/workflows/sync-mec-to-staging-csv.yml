@@ -106,6 +106,22 @@ jobs:
           print("[target] date keys:", list((data.get("date") or {}).keys()) if isinstance(data.get("date"), dict) else "no date block")
           print("[target] location keys:", list((data.get("locations") or {}).keys()) if isinstance(data.get("locations"), dict) else "no locations")
 
+          meta = data.get("meta") or {}
+          if isinstance(meta, dict):
+              for key in [
+                  "mec_in_days",
+                  "_ram_telehealth_mec_in_days",
+                  "mec_not_in_days",
+                  "_ram_telehealth_mec_not_in_days",
+                  "_ram_mec_start_date",
+                  "_ram_mec_end_date",
+                  "_ram_mec_start_time",
+                  "_ram_mec_end_time",
+              ]:
+                  value = str(meta.get(key) or "")
+                  print(f"[target-meta] {key} length={len(value)}")
+                  print(f"[target-meta] {key} value={value}")
+
           wanted_words = (
               "date", "dates", "day", "days", "repeat", "repeating",
               "occurrence", "occurrences", "start", "end", "time",
