@@ -660,6 +660,105 @@ def _safe_site(city: str, state: str) -> str:
     return ", ".join(parts)
 
 
+def _parse_city_state_from_address(address: str) -> Tuple[str, str]:
+    """Extract (city, state_abbr) from an address string when city is blank.
+
+    Conservative: only matches when the city portion contains no digits.
+    Returns ('', '') when the pattern is ambiguous or uncertain.
+    """
+    address = (address or "").strip()
+    if not address:
+        return "", ""
+
+    # Pattern A: "City, ST[ ZIP]" ΓÇö city part must start with a letter and contain no digits
+    # e.g. "Takoma Park, MD 20912" but NOT "8120 Carroll Ave Takoma Park, MD 20912"
+    m = re.match(r'^([A-Za-z][A-Za-z\s\.]{0,49}),\s*([A-Za-z]{2,})\s*\d*\s*$', address)
+    if m:
+        city_cand = m.group(1).strip()
+        state_cand = m.group(2).strip()
+        if not re.search(r'\d', city_cand):
+            state_abbr = _to_state_abbr(state_cand)
+            if len(state_abbr) == 2 and state_abbr.isupper() and state_abbr in _STATE_ABBR.values():
+                return city_cand, state_abbr
+
+    # Pattern B: "City StateName" ΓÇö no comma, ends with a recognised full state name
+    # e.g. "anchorage Alaska"
+    for state_name, abbr in _STATE_ABBR.items():
+        m = re.match(
+            r'^([A-Za-z][A-Za-z\s\.]{0,49})\s+' + re.escape(state_name) + r'\s*$',
+            address,
+            re.IGNORECASE,
+        )
+        if m:
+            city_cand = m.group(1).strip()
+            if not re.search(r'\d', city_cand):
+                return city_cand.title(), abbr
+
+    return "", ""
+
+
+def _parse_city_state_from_title(title: str) -> Tuple[str, str]:
+    """Extract (city, state_abbr) from an event title when city is blank.
+
+    Handles patterns like "Venue / City, State" or "City, StateName".
+    Conservative: only matches when city candidate contains no digits.
+    Returns ('', '') when uncertain.
+    """
+    title = (title or "").strip()
+    if not title:
+        return "", ""
+
+    _valid_abbrs = set(_STATE_ABBR.values())
+
+    # Try full state names first (more specific than 2-letter abbreviations)
+    for state_name, abbr in _STATE_ABBR.items():
+        m = re.search(
+            r'([A-Za-z][A-Za-z\s\.]{0,49}),\s*' + re.escape(state_name) + r'(?:\s*$|[\s,])',
+            title,
+            re.IGNORECASE,
+        )
+        if m:
+            # Handle "Venue / City, State" by taking the last segment after any slash
+            city_cand = m.group(1).strip().split("/")[-1].strip()
+            if city_cand and not re.search(r'\d', city_cand):
+                return city_cand, abbr
+
+    # Try 2-letter state abbreviations
+    for m in re.finditer(r'([A-Za-z][A-Za-z\s\.]{0,49}),\s*([A-Z]{2})(?:\s*$|[\s,])', title):
+        city_cand = m.group(1).strip().split("/")[-1].strip()
+        state_abbr = m.group(2).upper()
+        if state_abbr in _valid_abbrs and city_cand and not re.search(r'\d', city_cand):
+            return city_cand, state_abbr
+
+    return "", ""
+
+
+def derive_city_state_fallback(title: str, address: str, city: str, state: str) -> Tuple[str, str]:
+    """Return (city, state) with conservative fallbacks when city is blank.
+
+    Fallback order:
+      A. Use existing city (already from MEC location data)
+      B. Parse city/state from full address string
+      C. Parse city/state from event title (e.g. "Venue / City, State")
+      D. Return city/state unchanged if nothing can be derived
+    """
+    city = (city or "").strip()
+    state = (state or "").strip()
+
+    if city:
+        return city, state
+
+    city_b, state_b = _parse_city_state_from_address(address)
+    if city_b:
+        return city_b, state_b or state
+
+    city_c, state_c = _parse_city_state_from_title(title)
+    if city_c:
+        return city_c, state_c or state
+
+    return city, state
+
+
 def _fetch_event_detail(cfg: Cfg, sess: requests.Session, eid: int) -> Optional[Dict[str, Any]]:
     resp = _mec_get(cfg, sess, f"events/{eid}", params=None, allow_404=True)
     if resp.status_code == 404:
@@ -834,6 +933,14 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
 
     event_title = str(data.get("title") or "").strip()
     url = str(data.get("permalink") or "").strip()
+
+    # Apply city fallbacks when MEC location city is blank but state/address/title can supply it
+    fb_city, fb_state = derive_city_state_fallback(event_title, loc["address"], loc["city"], loc["state"])
+    if fb_city != loc["city"] or fb_state != loc["state"]:
+        _debug(cfg, f"[city_fallback] event={event_title!r} address={loc['address']!r} "
+                    f"city: {loc['city']!r} -> {fb_city!r}  state: {loc['state']!r} -> {fb_state!r}")
+    loc["city"] = fb_city
+    loc["state"] = fb_state
 
     # Determine clinic type (what your UI calls these)
     is_telehealth = bool(ctype["telehealth"])

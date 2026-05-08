@@ -1,0 +1,25 @@
+.claude/
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local deploy / secrets
+sftp.json
+.env
+.env.*
+*.pem
+*.key
+
+# Future build tooling
+node_modules/
+dist/
+build/
