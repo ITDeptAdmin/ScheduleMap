@@ -447,8 +447,23 @@ def _find_occurrence_blocks_anywhere(obj: Any) -> Iterable[Dict[str, Any]]:
                     stack.append(it)
 
 
-def _extract_occurrences_from_detail(detail: Dict[str, Any], max_span_days: int) -> List[Dict[str, Any]]:
+def _extract_occurrences_from_detail(
+    detail: Dict[str, Any], max_span_days: int, cfg: Optional[Cfg] = None
+) -> List[Dict[str, Any]]:
     occs_raw: List[Dict[str, Any]] = []
+    long_span_count = 0
+
+    _data = detail.get("data", {})
+    eid = (_data.get("ID") or _data.get("id")) if isinstance(_data, dict) else None
+
+    # Prefer explicit MEC/RAM custom dates before generic start/end blocks.
+    # Some MEC detail payloads expose only one mec_date block first, while the
+    # real telehealth schedule lives in meta._ram_telehealth_mec_in_days.
+    explicit_custom = _extract_mec_repeat_dates(detail, cfg=cfg)
+    if len(explicit_custom) > 1:
+        if cfg and cfg.debug:
+            _debug(cfg, f"[mec_debug] Using {len(explicit_custom)} explicit MEC meta/custom dates for Event ID {eid}")
+        return explicit_custom
 
     for b in _find_occurrence_blocks_anywhere(detail):
         s_obj = b.get("start") or {}
@@ -462,6 +477,7 @@ def _extract_occurrences_from_detail(detail: Dict[str, Any], max_span_days: int)
         sd = _parse_ymd(s_date)
         ed = _parse_ymd(e_date)
         if sd and ed and (ed - sd).days > max_span_days:
+            long_span_count += 1
             continue
 
         occs_raw.append(
@@ -472,6 +488,19 @@ def _extract_occurrences_from_detail(detail: Dict[str, Any], max_span_days: int)
                 "hide_time": b.get("hide_time"),
             }
         )
+
+    # If only long-span blocks were found, try explicit custom dates before giving up
+    if not occs_raw and long_span_count > 0:
+        custom = _extract_mec_repeat_dates(detail, cfg=cfg)
+        if custom:
+            if cfg and cfg.debug:
+                _debug(cfg, f"[mec_debug] Using {len(custom)} detail/custom dates for Event ID {eid}")
+            occs_raw = custom
+        else:
+            if cfg and cfg.debug:
+                _debug(cfg, f"[mec_debug] Skipping long span for Event ID {eid} because no custom dates were found")
+    elif occs_raw and cfg and cfg.debug:
+        _debug(cfg, f"[mec_debug] Using {len(occs_raw)} detail/custom dates for Event ID {eid}")
 
     # strong dedupe
     seen: Set[Tuple[str, str, str, str, str, str, str]] = set()
@@ -613,6 +642,219 @@ def _collapse_occurrences_to_span(occs: List[Dict[str, Any]]) -> Tuple[str, str]
         ends = starts[:]
 
     return (min(starts), max(ends))
+
+
+def _occ_is_long_span(occ: Dict[str, Any], max_span_days: int) -> bool:
+    s_obj = occ.get("start") or {}
+    e_obj = occ.get("end") or {}
+    s_date = str(s_obj.get("date") or "").strip()
+    e_date = str(e_obj.get("date") or s_date or "").strip()
+    sd = _parse_ymd(s_date)
+    ed = _parse_ymd(e_date)
+    return bool(sd and ed and (ed - sd).days > max_span_days)
+
+
+def _collect_ymd_arrays(obj: Any) -> List[List[str]]:
+    """Return all homogeneous YYYY-MM-DD string arrays (length >= 2) found anywhere in obj."""
+    results: List[List[str]] = []
+    stack: List[Any] = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, list):
+            ymd_items = [str(it) for it in cur if isinstance(it, str) and _YMD_RE.match(it.strip())]
+            if len(ymd_items) >= 2 and len(ymd_items) == len(cur):
+                results.append(ymd_items)
+            else:
+                for it in cur:
+                    if isinstance(it, (dict, list)):
+                        stack.append(it)
+        elif isinstance(cur, dict):
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+    return results
+def _parse_mec_time_token(tok: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse MEC time token like '09-00-AM' into (hour, minutes, ampm)."""
+    m = re.match(r"^(\d{1,2})-(\d{2})-(AM|PM)$", (tok or "").strip(), re.IGNORECASE)
+    if not m:
+        return (None, None, None)
+
+    return (m.group(1), m.group(2), m.group(3).upper())
+
+def _extract_mec_repeat_dates(detail: Dict[str, Any], cfg: Optional[Cfg] = None) -> List[Dict[str, Any]]:
+    """Extract explicit custom/repeat dates from MEC's data.date.days structure and related fields."""
+    data = detail.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+
+    date_block = data.get("date") or {}
+    if not isinstance(date_block, dict):
+        date_block = {}
+
+    hour        = date_block.get("hour")
+    minutes     = date_block.get("minutes")
+    ampm        = date_block.get("ampm")
+    end_hour    = date_block.get("end_hour") or hour
+    end_minutes = date_block.get("end_minutes") or minutes
+    end_ampm    = date_block.get("end_ampm") or ampm
+
+    meta = data.get("meta") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    eid_log = data.get("ID") or data.get("id")
+
+    meta_raw = ""
+    meta_field_name = ""
+
+    ram_meta_days = str(meta.get("_ram_telehealth_mec_in_days") or "").strip()
+    mec_meta_days = str(meta.get("mec_in_days") or "").strip()
+
+    if ram_meta_days:
+        meta_raw = ram_meta_days
+        meta_field_name = "_ram_telehealth_mec_in_days"
+    elif mec_meta_days:
+        meta_raw = mec_meta_days
+        meta_field_name = "mec_in_days"
+
+    range_start = str(meta.get("_ram_mec_start_date") or meta.get("mec_start_date") or "").strip()
+    range_end = str(meta.get("_ram_mec_end_date") or meta.get("mec_end_date") or "").strip()
+    has_range_filter = bool(_parse_ymd(range_start) and _parse_ymd(range_end))
+
+    if meta_raw:
+        meta_occs: List[Dict[str, Any]] = []
+        seen_meta: Set[Tuple[str, str, str, str, str, str, str]] = set()
+
+        for entry in meta_raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+
+            parts = entry.split(":")
+            if len(parts) < 2:
+                continue
+
+            s_date = parts[0].strip()
+            e_date = parts[1].strip()
+
+            if not _YMD_RE.match(s_date):
+                continue
+
+            if not e_date or not _YMD_RE.match(e_date):
+                e_date = s_date
+
+            if has_range_filter and not _ymd_in_range(s_date, range_start, range_end):
+                continue
+
+            s_h, s_m, s_ap = _parse_mec_time_token(parts[2]) if len(parts) >= 3 else (None, None, None)
+            e_h, e_m, e_ap = _parse_mec_time_token(parts[3]) if len(parts) >= 4 else (None, None, None)
+
+            dedup_key = (
+                s_date,
+                e_date,
+                s_h or "",
+                s_m or "",
+                s_ap or "",
+                e_h or "",
+                e_m or "",
+            )
+
+            if dedup_key in seen_meta:
+                continue
+
+            seen_meta.add(dedup_key)
+
+            s_obj: Dict[str, Any] = {"date": s_date}
+            e_obj: Dict[str, Any] = {"date": e_date}
+
+            if s_h is not None:
+                s_obj.update({"hour": s_h, "minutes": s_m, "ampm": s_ap})
+
+            if e_h is not None:
+                e_obj.update({"hour": e_h, "minutes": e_m, "ampm": e_ap})
+
+            has_time = s_h is not None
+
+            meta_occs.append({
+                "start": s_obj,
+                "end": e_obj,
+                "allday": "0" if has_time else "1",
+                "hide_time": "0" if has_time else "1",
+            })
+
+        if meta_occs:
+            if cfg and cfg.debug:
+                msg = f"[mec_debug] Using {len(meta_occs)} meta custom dates for Event ID {eid_log} from {meta_field_name}"
+                if has_range_filter:
+                    msg += f" within {range_start} -> {range_end}"
+                _debug(cfg, msg)
+            return meta_occs
+           
+    candidate_dates: List[str] = []
+
+    # 1) data.date.days — keys or nested dicts may hold YYYY-MM-DD dates
+    days_val = date_block.get("days")
+    if isinstance(days_val, dict):
+        for k, v in days_val.items():
+            k_str = str(k).strip()
+            if _YMD_RE.match(k_str):
+                candidate_dates.append(k_str)
+            elif isinstance(v, dict):
+                d_str = str(v.get("date") or "").strip()
+                if _YMD_RE.match(d_str):
+                    candidate_dates.append(d_str)
+
+    # 2) known list-of-dates keys in date_block and data
+    for key in ("start_date_list", "date_list", "custom_dates"):
+        for src in (date_block, data):
+            val = src.get(key)
+            if isinstance(val, list):
+                for item in val:
+                    s = str(item.get("date") if isinstance(item, dict) else item).strip()
+                    if _YMD_RE.match(s):
+                        candidate_dates.append(s)
+            elif isinstance(val, dict):
+                for k, v in val.items():
+                    k_str = str(k).strip()
+                    if _YMD_RE.match(k_str):
+                        candidate_dates.append(k_str)
+                    elif isinstance(v, dict):
+                        d_str = str(v.get("date") or "").strip()
+                        if _YMD_RE.match(d_str):
+                            candidate_dates.append(d_str)
+
+    # 3) deep scan for homogeneous YYYY-MM-DD arrays (fallback)
+    if not candidate_dates:
+        for arr in _collect_ymd_arrays(detail):
+            candidate_dates.extend(arr)
+
+    if not candidate_dates:
+        return []
+
+    seen_d: Set[str] = set()
+    unique_dates: List[str] = []
+    for d in candidate_dates:
+        if d not in seen_d:
+            seen_d.add(d)
+            unique_dates.append(d)
+    unique_dates.sort()
+
+    has_time = hour is not None
+    occs: List[Dict[str, Any]] = []
+    for d in unique_dates:
+        s_obj: Dict[str, Any] = {"date": d}
+        e_obj: Dict[str, Any] = {"date": d}
+        if has_time:
+            s_obj.update({"hour": hour, "minutes": minutes, "ampm": ampm})
+            e_obj.update({"hour": end_hour, "minutes": end_minutes, "ampm": end_ampm})
+        occs.append({
+            "start":     s_obj,
+            "end":       e_obj,
+            "allday":    "0" if has_time else "1",
+            "hide_time": "0" if has_time else "1",
+        })
+
+    return occs
 
 
 def _ymd_in_range(d: str, start: str, end: str) -> bool:
@@ -950,8 +1192,27 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
     # Prefer facility name, otherwise fall back to MEC event title
     display_title = loc["facility"].strip() or event_title
 
-    # Occurrences:
-    occs = occ_hints if occ_hints else _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days)
+    eid = data.get("ID") or data.get("id")
+
+    # Occurrences: prefer list hints, fall back to detail extraction
+    if occ_hints:
+        # For telehealth: if all hints are long-span, try explicit custom dates instead
+        if is_telehealth and all(_occ_is_long_span(h, cfg.max_span_days) for h in occ_hints):
+            custom = _extract_mec_repeat_dates(detail, cfg=cfg)
+            if custom:
+                if cfg.debug:
+                    _debug(cfg, f"[mec_debug] Using {len(custom)} detail/custom dates for Event ID {eid}")
+                occs = custom
+            else:
+                if cfg.debug:
+                    _debug(cfg, f"[mec_debug] Using {len(occ_hints)} list occurrence hints for Event ID {eid}")
+                occs = occ_hints
+        else:
+            if cfg.debug:
+                _debug(cfg, f"[mec_debug] Using {len(occ_hints)} list occurrence hints for Event ID {eid}")
+            occs = occ_hints
+    else:
+        occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days, cfg=cfg)
 
     if cfg.debug:
         if fields.get("services"):
@@ -959,7 +1220,6 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
         else:
             _debug(cfg, f"[svc] services_field=MISSING title='{event_title}' (taxonomy fallback: '{tax_text}')")
         if not occs:
-            eid = data.get("ID") or data.get("id")
             _debug(cfg, f"[warn] No occurrences parsed for event {eid} title={event_title!r}")
 
     if not occs:
@@ -1157,6 +1417,29 @@ def main() -> None:
 
     event_ids, occ_map = _iter_all_occurrences(cfg, sess)
     _debug(cfg, f"[mec] Total unique event IDs: {len(event_ids)} (with occurrence hints for {len(occ_map)})")
+
+    extra_ids_raw = (os.environ.get("EXTRA_EVENT_IDS", "") or "").strip()
+    if extra_ids_raw:
+        added_extra_ids: List[str] = []
+
+        for raw_id in extra_ids_raw.split(","):
+            raw_id = raw_id.strip()
+            if not raw_id:
+                continue
+
+            try:
+                extra_eid = int(raw_id)
+            except ValueError:
+                if cfg.debug:
+                    _debug(cfg, f"[mec_debug] Ignoring invalid EXTRA_EVENT_IDS value: {raw_id}")
+                continue
+
+            if extra_eid not in event_ids:
+                event_ids.add(extra_eid)
+                added_extra_ids.append(str(extra_eid))
+
+        if added_extra_ids and cfg.debug:
+            _debug(cfg, f"[mec_debug] Added EXTRA_EVENT_IDS: {', '.join(added_extra_ids)}")
 
     all_rows: List[Dict[str, str]] = []
     skipped_404 = 0
