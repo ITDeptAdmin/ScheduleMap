@@ -717,9 +717,12 @@ def _extract_mec_repeat_dates(detail: Dict[str, Any], cfg: Optional[Cfg] = None)
         meta_raw = mec_meta_days
         meta_field_name = "mec_in_days"
 
-    range_start = str(meta.get("_ram_mec_start_date") or meta.get("mec_start_date") or "").strip()
-    range_end = str(meta.get("_ram_mec_end_date") or meta.get("mec_end_date") or "").strip()
-    has_range_filter = bool(_parse_ymd(range_start) and _parse_ymd(range_end))
+      # Do not filter mec_in_days by the event's primary mec_start_date/mec_end_date.
+      # For repeating/custom-day events, those primary dates may only represent the
+      # first/main event date and can incorrectly exclude later valid occurrences.
+      range_start = ""
+      range_end = ""
+      has_range_filter = False
 
     if meta_raw:
         meta_occs: List[Dict[str, Any]] = []
@@ -1194,23 +1197,20 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
 
     eid = data.get("ID") or data.get("id")
 
-    # Occurrences: prefer list hints, fall back to detail extraction
-    if occ_hints:
-        # For telehealth: if all hints are long-span, try explicit custom dates instead
-        if is_telehealth and all(_occ_is_long_span(h, cfg.max_span_days) for h in occ_hints):
-            custom = _extract_mec_repeat_dates(detail, cfg=cfg)
-            if custom:
-                if cfg.debug:
-                    _debug(cfg, f"[mec_debug] Using {len(custom)} detail/custom dates for Event ID {eid}")
-                occs = custom
-            else:
-                if cfg.debug:
-                    _debug(cfg, f"[mec_debug] Using {len(occ_hints)} list occurrence hints for Event ID {eid}")
-                occs = occ_hints
-        else:
-            if cfg.debug:
-                _debug(cfg, f"[mec_debug] Using {len(occ_hints)} list occurrence hints for Event ID {eid}")
-            occs = occ_hints
+    # Occurrences:
+    # Telehealth should prefer explicit MEC custom/repeating dates first.
+    # The MEC list endpoint can return incomplete occurrence hints, so do not
+    # let list hints override mec_in_days / _ram_telehealth_mec_in_days.
+    explicit_custom = _extract_mec_repeat_dates(detail, cfg=cfg) if is_telehealth else []
+
+    if is_telehealth and explicit_custom:
+        if cfg.debug:
+            _debug(cfg, f"[mec_debug] Using {len(explicit_custom)} explicit custom/repeat dates for Event ID {eid}")
+        occs = explicit_custom
+    elif occ_hints:
+        if cfg.debug:
+            _debug(cfg, f"[mec_debug] Using {len(occ_hints)} list occurrence hints for Event ID {eid}")
+        occs = occ_hints
     else:
         occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days, cfg=cfg)
 
