@@ -717,12 +717,12 @@ def _extract_mec_repeat_dates(detail: Dict[str, Any], cfg: Optional[Cfg] = None)
         meta_raw = mec_meta_days
         meta_field_name = "mec_in_days"
 
-      # Do not filter mec_in_days by the event's primary mec_start_date/mec_end_date.
-      # For repeating/custom-day events, those primary dates may only represent the
-      # first/main event date and can incorrectly exclude later valid occurrences.
-      range_start = ""
-      range_end = ""
-      has_range_filter = False
+    # Do not filter mec_in_days by the event's primary mec_start_date/mec_end_date.
+    # For repeating/custom-day events, those primary dates may only represent the
+    # first/main event date and can incorrectly exclude later valid occurrences.
+    range_start = ""
+    range_end = ""
+    has_range_filter = False
 
     if meta_raw:
         meta_occs: List[Dict[str, Any]] = []
