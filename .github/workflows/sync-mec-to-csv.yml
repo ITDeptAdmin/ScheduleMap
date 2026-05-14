@@ -61,7 +61,82 @@ jobs:
           fi
 
           echo "Main MEC base URL and token are configured."
+      - name: Show MEC host and debug Central Services event
+        env:
+          MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
+          MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
+          TARGET_EVENT_ID: "26031"
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import requests
+          from urllib.parse import urlparse
 
+          base = os.environ["MEC_BASE_URL"].rstrip("/")
+          token = os.environ["MEC_TOKEN"]
+          event_id = os.environ["TARGET_EVENT_ID"]
+
+          print("[debug] MEC host:", urlparse(base).netloc)
+
+          url = f"{base}/events/{event_id}"
+          r = requests.get(url, headers={"mec-token": token}, timeout=60)
+
+          print(f"[target] GET /events/{event_id} -> {r.status_code}")
+
+          if r.status_code != 200:
+              print("[target] body:", r.text[:500])
+              raise SystemExit(0)
+
+          payload = r.json()
+          data = payload.get("data", {}) if isinstance(payload, dict) else {}
+
+          print("[target] title:", data.get("title"))
+          print("[target] permalink:", data.get("permalink"))
+          print("[target] status:", data.get("status") or data.get("post_status") or data.get("event_status"))
+          print("[target] data keys:", list(data.keys()))
+          print("[target] date keys:", list((data.get("date") or {}).keys()) if isinstance(data.get("date"), dict) else "no date block")
+          print("[target] location keys:", list((data.get("locations") or {}).keys()) if isinstance(data.get("locations"), dict) else "no locations")
+
+          wanted_words = (
+              "date", "dates", "day", "days", "repeat", "repeating",
+              "occurrence", "occurrences", "start", "end", "time",
+              "mec_start", "mec_end", "mec_repeat", "mec_in_days"
+          )
+
+          matches = []
+
+          def walk(obj, path="root"):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      key_text = str(k).lower()
+                      next_path = f"{path}.{k}"
+
+                      if any(word in key_text for word in wanted_words):
+                          matches.append((next_path, v))
+
+                      walk(v, next_path)
+
+              elif isinstance(obj, list):
+                  for i, v in enumerate(obj):
+                      walk(v, f"{path}[{i}]")
+
+          walk(payload)
+
+          print("[target] date-related matches:", len(matches))
+
+          for path, value in matches[:100]:
+              try:
+                  compact = json.dumps(value, ensure_ascii=False)
+              except Exception:
+                  compact = str(value)
+              if len(compact) > 500:
+                  compact = compact[:500] + "..."
+              print(f"[target-path] {path} = {compact}")
+
+          if len(matches) > 100:
+              print(f"[target] showing first 100 of {len(matches)} date-related matches")
+          PY
       - name: Build CSV from MEC
         env:
           MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
