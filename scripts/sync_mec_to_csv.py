@@ -710,12 +710,26 @@ def _extract_mec_repeat_dates(detail: Dict[str, Any], cfg: Optional[Cfg] = None)
     ram_meta_days = str(meta.get("_ram_telehealth_mec_in_days") or "").strip()
     mec_meta_days = str(meta.get("mec_in_days") or "").strip()
 
-    if ram_meta_days:
-        meta_raw = ram_meta_days
-        meta_field_name = "_ram_telehealth_mec_in_days"
-    elif mec_meta_days:
+    # IMPORTANT:
+    # mec_in_days is MEC's current custom/repeating-date field.
+    # _ram_telehealth_mec_in_days is only a RAM backup/helper field and can become stale
+    # if someone manually removes dates in MEC.
+    #
+    # Default behavior: trust MEC's current field first.
+    # Only allow the RAM backup fallback if explicitly enabled in the workflow env.
+    allow_ram_meta_fallback = (
+        os.environ.get("ALLOW_RAM_TELEHEALTH_META_FALLBACK", "0")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "y"}
+    )
+
+    if mec_meta_days:
         meta_raw = mec_meta_days
         meta_field_name = "mec_in_days"
+    elif allow_ram_meta_fallback and ram_meta_days:
+        meta_raw = ram_meta_days
+        meta_field_name = "_ram_telehealth_mec_in_days"
 
     # Do not filter mec_in_days by the event's primary mec_start_date/mec_end_date.
     # For repeating/custom-day events, those primary dates may only represent the
@@ -1198,21 +1212,27 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
     eid = data.get("ID") or data.get("id")
 
     # Occurrences:
-    # Telehealth should prefer explicit MEC custom/repeating dates first.
-    # The MEC list endpoint can return incomplete occurrence hints, so do not
-    # let list hints override mec_in_days / _ram_telehealth_mec_in_days.
-    explicit_custom = _extract_mec_repeat_dates(detail, cfg=cfg) if is_telehealth else []
+    # Telehealth events must use CURRENT MEC custom/repeating dates only.
+    # Do not fall back to MEC /events list occurrence hints for telehealth,
+    # because that endpoint can keep returning removed/stale custom dates.
+    if is_telehealth:
+        explicit_custom = _extract_mec_repeat_dates(detail, cfg=cfg)
 
-    if is_telehealth and explicit_custom:
-        if cfg.debug:
-            _debug(cfg, f"[mec_debug] Using {len(explicit_custom)} explicit custom/repeat dates for Event ID {eid}")
-        occs = explicit_custom
-    elif occ_hints:
-        if cfg.debug:
-            _debug(cfg, f"[mec_debug] Using {len(occ_hints)} list occurrence hints for Event ID {eid}")
-        occs = occ_hints
+        if explicit_custom:
+            if cfg.debug:
+                _debug(cfg, f"[mec_debug] Telehealth using {len(explicit_custom)} CURRENT custom/repeat dates for Event ID {eid}")
+            occs = explicit_custom
+        else:
+            if cfg.debug:
+                _debug(cfg, f"[mec_debug] Skipping telehealth Event ID {eid} because no current MEC custom dates were found")
+            return []
     else:
-        occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days, cfg=cfg)
+        if occ_hints:
+            if cfg.debug:
+                _debug(cfg, f"[mec_debug] Popup using {len(occ_hints)} list occurrence hints for Event ID {eid}")
+            occs = occ_hints
+        else:
+            occs = _extract_occurrences_from_detail(detail, max_span_days=cfg.max_span_days, cfg=cfg)
 
     if cfg.debug:
         if fields.get("services"):
@@ -1223,6 +1243,11 @@ def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[
             _debug(cfg, f"[warn] No occurrences parsed for event {eid} title={event_title!r}")
 
     if not occs:
+        if is_telehealth:
+            if cfg.debug:
+                _debug(cfg, f"[mec_debug] Skipping telehealth Event ID {eid} because no occurrences were found")
+            return []
+
         occs = [{"start": {"date": ""}, "end": {"date": ""}, "allday": "1", "hide_time": "1"}]
 
     rows: List[Dict[str, str]] = []
