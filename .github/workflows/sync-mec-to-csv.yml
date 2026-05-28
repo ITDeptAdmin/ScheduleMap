@@ -188,3 +188,50 @@ jobs:
           git add "Clinic Master Schedule for git.csv"
           git commit -m "Sync MEC events -> MAIN schedule CSV"
           git push origin HEAD:main
+
+      - name: Upload CSV to RAM website
+        if: github.ref == 'refs/heads/main'
+        env:
+          SFTP_PROD_HOST: ${{ secrets.SFTP_PROD_HOST }}
+          SFTP_PROD_PORT: ${{ secrets.SFTP_PROD_PORT }}
+          SFTP_PROD_USERNAME: ${{ secrets.SFTP_PROD_USERNAME }}
+          SFTP_PROD_PRIVATE_KEY: ${{ secrets.SFTP_PROD_PRIVATE_KEY }}
+          SFTP_PROD_REMOTE_CSV_PATH: ${{ secrets.SFTP_PROD_REMOTE_CSV_PATH }}
+        run: |
+          echo "Website CSV upload started"
+
+          # Write private key — GitHub Actions masks the value in logs
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SFTP_PROD_PRIVATE_KEY" > ~/.ssh/prod_key
+          chmod 600 ~/.ssh/prod_key
+
+          # Add server host key to known_hosts (-H hashes the entry for privacy)
+          ssh-keyscan -p "$SFTP_PROD_PORT" -H "$SFTP_PROD_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Derive remote directory and temp path from the full remote CSV path
+          REMOTE_DIR="$(dirname "$SFTP_PROD_REMOTE_CSV_PATH")"
+          REMOTE_TMP="${SFTP_PROD_REMOTE_CSV_PATH}.tmp"
+
+          # Ensure remote directory exists
+          ssh -i ~/.ssh/prod_key -p "$SFTP_PROD_PORT" \
+            -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            "${SFTP_PROD_USERNAME}@${SFTP_PROD_HOST}" \
+            "mkdir -p '$REMOTE_DIR'"
+
+          # Upload to a temporary file to avoid a partial read by the website
+          scp -i ~/.ssh/prod_key -P "$SFTP_PROD_PORT" \
+            -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            "Clinic Master Schedule for git.csv" \
+            "${SFTP_PROD_USERNAME}@${SFTP_PROD_HOST}:${REMOTE_TMP}"
+
+          # Atomically move into place and set world-readable permissions
+          ssh -i ~/.ssh/prod_key -p "$SFTP_PROD_PORT" \
+            -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            "${SFTP_PROD_USERNAME}@${SFTP_PROD_HOST}" \
+            "mv '$REMOTE_TMP' '$SFTP_PROD_REMOTE_CSV_PATH' && chmod 644 '$SFTP_PROD_REMOTE_CSV_PATH'"
+
+          # Remove key from runner disk (runner is ephemeral, but belt-and-suspenders)
+          rm -f ~/.ssh/prod_key
+
+          echo "Website CSV upload completed"
