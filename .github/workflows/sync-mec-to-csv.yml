@@ -1,7 +1,12 @@
 name: Sync MEC events to MAIN schedule CSV
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      upload_existing_csv_only:
+        description: Upload the existing committed CSV to the RAM website without calling the MEC API.
+        type: boolean
+        default: false
   schedule:
     - cron: "*/30 * * * *" # every 30 minutes
 
@@ -35,16 +40,19 @@ jobs:
           fi
 
       - name: Setup Python
+        if: inputs.upload_existing_csv_only != true
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
+        if: inputs.upload_existing_csv_only != true
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
       - name: Check MEC secrets
+        if: inputs.upload_existing_csv_only != true
         shell: bash
         env:
           MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
@@ -62,6 +70,7 @@ jobs:
 
           echo "Main MEC base URL and token are configured."
       - name: Show MEC host and debug Central Services event
+        if: inputs.upload_existing_csv_only != true
         env:
           MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
           MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
@@ -138,6 +147,7 @@ jobs:
               print(f"[target] showing first 100 of {len(matches)} date-related matches")
           PY
       - name: Build CSV from MEC
+        if: inputs.upload_existing_csv_only != true
         env:
           MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
           MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
@@ -157,6 +167,7 @@ jobs:
           python scripts/sync_mec_to_csv.py
 
       - name: Show CSV diff
+        if: inputs.upload_existing_csv_only != true
         shell: bash
         run: |
           git status --short
@@ -164,6 +175,7 @@ jobs:
           git diff -- "Clinic Master Schedule for git.csv" | head -n 200 || true
 
       - name: Final branch safety check before push
+        if: inputs.upload_existing_csv_only != true
         shell: bash
         run: |
           CURRENT_BRANCH="$(git branch --show-current)"
@@ -175,6 +187,7 @@ jobs:
           fi
 
       - name: Commit changes if any
+        if: inputs.upload_existing_csv_only != true
         shell: bash
         run: |
           if git diff --quiet -- "Clinic Master Schedule for git.csv"; then
@@ -199,6 +212,22 @@ jobs:
           SFTP_PROD_REMOTE_CSV_PATH: ${{ secrets.SFTP_PROD_REMOTE_CSV_PATH }}
         run: |
           echo "Website CSV upload started"
+
+          # Validate required secrets are present — print only variable name, never value
+          for VAR in SFTP_PROD_HOST SFTP_PROD_PORT SFTP_PROD_USERNAME SFTP_PROD_PRIVATE_KEY SFTP_PROD_REMOTE_CSV_PATH; do
+            if [ -z "${!VAR}" ]; then
+              echo "ERROR: Required secret $VAR is not set."
+              exit 1
+            fi
+          done
+          echo "Required upload secrets present"
+
+          # Validate remote CSV path ends in .csv
+          if [[ "$SFTP_PROD_REMOTE_CSV_PATH" != *.csv ]]; then
+            echo "ERROR: SFTP_PROD_REMOTE_CSV_PATH must be the full remote CSV file path ending in .csv"
+            exit 1
+          fi
+          echo "Remote CSV path format OK"
 
           # Write private key — GitHub Actions masks the value in logs
           mkdir -p ~/.ssh
