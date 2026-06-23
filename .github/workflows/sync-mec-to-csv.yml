@@ -159,6 +159,32 @@ jobs:
           if len(matches) > 100:
               print(f"[target] showing first 100 of {len(matches)} date-related matches")
           PY
+      - name: Diagnose MEC API response headers
+        if: inputs.upload_existing_csv_only != true
+        env:
+          MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
+          MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
+        run: |
+          set +e
+          echo "UTC time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Eastern time: $(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Runner public IP:"
+          curl -sS https://api.ipify.org || true
+          echo ""
+          URL="${MEC_BASE_URL%/}/events?limit=1&include_past_events=1&include_ongoing_events=1&start_date=2010-01-01&offset=0"
+          echo "Testing MEC API headers/body sample..."
+          curl -sS -D /tmp/mec_headers.txt -o /tmp/mec_body.txt \
+            -H "mec-token: ${MEC_TOKEN}" \
+            -H "User-Agent: ram-mec-sync-diagnostic/1.0" \
+            -H "Accept: application/json,text/plain,*/*" \
+            --max-time 30 \
+            "$URL" || true
+          echo "----- RESPONSE HEADERS -----"
+          cat /tmp/mec_headers.txt || true
+          echo "----- RESPONSE BODY FIRST 1000 BYTES -----"
+          head -c 1000 /tmp/mec_body.txt || true
+          echo ""
+
       - name: Build CSV from MEC
         if: inputs.upload_existing_csv_only != true
         env:
