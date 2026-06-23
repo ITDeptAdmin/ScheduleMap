@@ -1369,6 +1369,59 @@ def _dedupe_rows_global(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
     return out
 
 
+def _postprocess_global_display_duplicates(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[str, str]]:
+    """Collapse cross-event telehealth rows that look identical on the public schedule card.
+
+    Only telehealth rows are collapsed here. Popup rows are never touched.
+    Two rows are considered display-identical when these fields match (normalised):
+      telehealth, clinic_type, city, state, facility, address,
+      start_date, end_date, start_time, end_time,
+      medical, dental, vision, dentures
+
+    URL is intentionally excluded so that two different MEC event IDs for the
+    same location/time are merged into whichever row was encountered first.
+    """
+    _DISPLAY_KEY_FIELDS = (
+        "telehealth", "clinic_type", "city", "state", "facility", "address",
+        "start_date", "end_date", "start_time", "end_time",
+        "medical", "dental", "vision", "dentures",
+    )
+
+    def _nv(v: str) -> str:
+        return re.sub(r"\s+", " ", (v or "").strip()).lower()
+
+    seen: Dict[Tuple[str, ...], Dict[str, str]] = {}
+    out: List[Dict[str, str]] = []
+    dup_examples: List[Tuple[Dict[str, str], Dict[str, str]]] = []
+
+    for r in rows:
+        # Only collapse telehealth rows
+        if _nv(r.get("telehealth", "")) != "yes":
+            out.append(r)
+            continue
+
+        key = tuple(_nv(r.get(f, "")) for f in _DISPLAY_KEY_FIELDS)
+
+        if key not in seen:
+            seen[key] = r
+            out.append(r)
+        else:
+            if cfg.debug:
+                dup_examples.append((seen[key], r))
+
+    if cfg.debug:
+        for kept, dropped in dup_examples[:5]:
+            _debug(cfg, (
+                f"[global_clean] dup example: {kept.get('city','')}, {kept.get('state','')} "
+                f"/ {kept.get('facility','')} / {kept.get('start_date','')}"
+                f"\n  kept URL:    {kept.get('url','')}"
+                f"\n  dropped URL: {dropped.get('url','')}"
+            ))
+
+    print(f"[global_clean] collapsed public display duplicates: {len(rows)} -> {len(out)}")
+    return out
+
+
 def _write_csv(cfg: Cfg, rows: Sequence[Dict[str, str]]) -> None:
     os.makedirs(os.path.dirname(cfg.csv_path) or ".", exist_ok=True)
     with open(cfg.csv_path, "w", encoding="utf-8", newline="") as f:
@@ -1601,8 +1654,11 @@ def main() -> None:
 
     before = len(all_rows)
     all_rows = _dedupe_rows_global(all_rows)
-    after = len(all_rows)
     skipped_404 = len(skipped_404_ids)
+
+    # Remove cross-event telehealth rows that appear identical on the public schedule card
+    all_rows = _postprocess_global_display_duplicates(all_rows, cfg)
+    after = len(all_rows)
 
     # Validate REQUIRED_EVENT_IDS — fail before writing if any required event is missing or empty
     if required_ids:
