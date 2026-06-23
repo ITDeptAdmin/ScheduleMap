@@ -3,6 +3,14 @@ name: Sync MEC events to MAIN schedule CSV
 on:
   workflow_dispatch:
     inputs:
+      dry_run:
+        description: "Dry run: generate and validate CSV but do not commit, push, or upload"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
       upload_existing_csv_only:
         description: Upload the existing committed CSV to the RAM website without calling the MEC API.
         type: boolean
@@ -16,6 +24,11 @@ permissions:
 concurrency:
   group: sync-mec-to-csv
   cancel-in-progress: true
+
+# Set to "true" to allow scheduled runs to commit, push, and upload.
+# Keep "false" while testing to prevent the every-30-minute schedule from writing to production.
+env:
+  ALLOW_SCHEDULED_PRODUCTION_SYNC: "false"
 
 jobs:
   sync:
@@ -176,8 +189,19 @@ jobs:
           git diff --stat -- "Clinic Master Schedule for git.csv" || true
           git diff -- "Clinic Master Schedule for git.csv" | head -n 200 || true
 
+      - name: Stop before commit/upload during dry run
+        if: inputs.dry_run == 'true' && inputs.upload_existing_csv_only != true
+        run: |
+          echo "Dry run enabled. CSV was generated and validated but will not be committed, pushed, or uploaded."
+
+      - name: Stop before commit/upload during scheduled sync guard
+        if: github.event_name == 'schedule' && env.ALLOW_SCHEDULED_PRODUCTION_SYNC != 'true'
+        run: |
+          echo "Scheduled production sync is currently disabled by ALLOW_SCHEDULED_PRODUCTION_SYNC=false."
+          echo "CSV was generated and validated, but will not be committed, pushed, or uploaded."
+
       - name: Final branch safety check before push
-        if: inputs.upload_existing_csv_only != true
+        if: inputs.upload_existing_csv_only != true && inputs.dry_run != 'true' && (github.event_name != 'schedule' || env.ALLOW_SCHEDULED_PRODUCTION_SYNC == 'true')
         shell: bash
         run: |
           CURRENT_BRANCH="$(git branch --show-current)"
@@ -189,7 +213,7 @@ jobs:
           fi
 
       - name: Commit changes if any
-        if: inputs.upload_existing_csv_only != true
+        if: inputs.upload_existing_csv_only != true && inputs.dry_run != 'true' && (github.event_name != 'schedule' || env.ALLOW_SCHEDULED_PRODUCTION_SYNC == 'true')
         shell: bash
         run: |
           if git diff --quiet -- "Clinic Master Schedule for git.csv"; then
@@ -205,7 +229,7 @@ jobs:
           git push origin HEAD:main
 
       - name: Upload CSV to RAM website
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && (inputs.dry_run != 'true' || inputs.upload_existing_csv_only == true) && (github.event_name != 'schedule' || env.ALLOW_SCHEDULED_PRODUCTION_SYNC == 'true')
         env:
           SFTP_PROD_HOST: ${{ secrets.SFTP_PROD_HOST }}
           SFTP_PROD_PORT: ${{ secrets.SFTP_PROD_PORT }}
