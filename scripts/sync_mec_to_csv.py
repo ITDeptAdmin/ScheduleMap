@@ -1429,6 +1429,95 @@ def _load_cfg() -> Cfg:
     )
 
 
+def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session) -> Set[int]:
+    """Discover MEC event post IDs via the WordPress REST API.
+
+    Tries GET /wp/v2/mec-events?per_page=100&page=N&status=publish.
+    Returns an empty set without failing if the endpoint is unavailable (404)
+    or returns unexpected responses.
+    """
+    mec_base = cfg.base_url.rstrip("/")
+    wp_json_idx = mec_base.lower().find("/wp-json")
+    if wp_json_idx == -1:
+        _debug(cfg, "[wp_rest] Cannot derive WP REST base from MEC_BASE_URL; skipping WP REST discovery")
+        return set()
+    wp_json_base = mec_base[: wp_json_idx + len("/wp-json")]
+    endpoint = f"{wp_json_base}/wp/v2/mec-events"
+
+    found_ids: Set[int] = set()
+    page = 1
+
+    while True:
+        params = {"per_page": "100", "page": str(page), "status": "publish"}
+        try:
+            resp = sess.get(endpoint, params=params, timeout=60)
+        except Exception as exc:
+            _debug(cfg, f"[wp_rest] Request error on page {page}: {exc}; stopping WP REST discovery")
+            break
+
+        if page == 1 and resp.status_code == 404:
+            print("[discovery] WP REST /wp/v2/mec-events returned 404 — endpoint unavailable, skipping")
+            return set()
+
+        # WP REST returns 400 when the requested page number exceeds total pages
+        if resp.status_code == 400:
+            break
+
+        if resp.status_code != 200:
+            _debug(cfg, f"[wp_rest] HTTP {resp.status_code} on page {page}; stopping WP REST discovery")
+            break
+
+        try:
+            items = resp.json()
+        except Exception:
+            _debug(cfg, f"[wp_rest] Non-JSON response on page {page}; stopping WP REST discovery")
+            break
+
+        if not isinstance(items, list) or not items:
+            break
+
+        for item in items:
+            if isinstance(item, dict):
+                raw_id = item.get("id")
+                if raw_id is not None:
+                    try:
+                        found_ids.add(int(raw_id))
+                    except (ValueError, TypeError):
+                        pass
+
+        # Honour X-WP-TotalPages to avoid unnecessary requests
+        try:
+            total_pages = int(resp.headers.get("X-WP-TotalPages", "0"))
+        except (ValueError, TypeError):
+            total_pages = 0
+        if total_pages and page >= total_pages:
+            break
+
+        page += 1
+
+    return found_ids
+
+
+def _parse_id_list(env_var: str) -> List[int]:
+    """Parse a comma-separated list of integer event IDs from an env var.
+
+    Ignores blank tokens and prints a warning for non-integer values.
+    """
+    raw = (os.environ.get(env_var, "") or "").strip()
+    if not raw:
+        return []
+    result: List[int] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            result.append(int(tok))
+        except ValueError:
+            print(f"[warn] {env_var}: ignoring invalid ID value: {tok!r}")
+    return result
+
+
 def main() -> None:
     cfg = _load_cfg()
     delimiter_label = "TAB" if cfg.delimiter == "\t" else "COMMA"
@@ -1441,47 +1530,101 @@ def main() -> None:
     sess = _session()
 
     event_ids, occ_map = _iter_all_occurrences(cfg, sess)
-    _debug(cfg, f"[mec] Total unique event IDs: {len(event_ids)} (with occurrence hints for {len(occ_map)})")
+    discovered_count = len(event_ids)
+    print(f"[discovery] MEC pagination discovered {discovered_count} event IDs")
 
-    extra_ids_raw = (os.environ.get("EXTRA_EVENT_IDS", "") or "").strip()
-    if extra_ids_raw:
-        added_extra_ids: List[str] = []
+    # Secondary discovery: WordPress REST API post listing
+    mec_ids: Set[int] = set(event_ids)  # snapshot of MEC-only discovery for audit
+    wp_ids = _iter_wp_mec_event_post_ids(cfg, sess)
+    wp_missing_from_mec = sorted(wp_ids - mec_ids)
+    event_ids.update(wp_ids)
+    print(f"[discovery] WP REST post discovery found {len(wp_ids)} event IDs")
+    print(f"[discovery] WP REST event IDs added: {len(wp_missing_from_mec)}")
+    if wp_missing_from_mec:
+        display = wp_missing_from_mec[:50]
+        suffix = f" (showing first 50 of {len(wp_missing_from_mec)} total)" if len(wp_missing_from_mec) > 50 else ""
+        print(f"[discovery_audit] WP REST IDs missing from MEC pagination: {display}{suffix}")
+    else:
+        print("[discovery_audit] WP REST IDs missing from MEC pagination: []")
 
-        for raw_id in extra_ids_raw.split(","):
-            raw_id = raw_id.strip()
-            if not raw_id:
-                continue
+    # Merge EXTRA_EVENT_IDS and FORCE_MEC_EVENT_IDS into the working set
+    forced_ids = _parse_id_list("EXTRA_EVENT_IDS") + _parse_id_list("FORCE_MEC_EVENT_IDS")
+    forced_ids_set: Set[int] = set(forced_ids)
+    added_forced: List[int] = []
+    for fid in forced_ids:
+        if fid not in event_ids:
+            event_ids.add(fid)
+            added_forced.append(fid)
 
-            try:
-                extra_eid = int(raw_id)
-            except ValueError:
-                if cfg.debug:
-                    _debug(cfg, f"[mec_debug] Ignoring invalid EXTRA_EVENT_IDS value: {raw_id}")
-                continue
+    if added_forced:
+        print(f"[discovery] Forced event IDs added (not from pagination): {added_forced}")
+    print(f"[discovery] Total event IDs to fetch: {len(event_ids)}")
 
-            if extra_eid not in event_ids:
-                event_ids.add(extra_eid)
-                added_extra_ids.append(str(extra_eid))
+    # Parse validation parameters
+    required_ids = _parse_id_list("REQUIRED_EVENT_IDS")
+    min_row_count_raw = (os.environ.get("MIN_ROW_COUNT", "") or "").strip()
+    min_row_count: Optional[int] = int(min_row_count_raw) if min_row_count_raw else None
 
-        if added_extra_ids and cfg.debug:
-            _debug(cfg, f"[mec_debug] Added EXTRA_EVENT_IDS: {', '.join(added_extra_ids)}")
+    if required_ids:
+        print(f"[validation] REQUIRED_EVENT_IDS: {required_ids}")
+    if min_row_count is not None:
+        print(f"[validation] MIN_ROW_COUNT: {min_row_count}")
+
+    # Source audit: show where each required and forced event ID came from
+    required_ids_set: Set[int] = set(required_ids)
+    for aid in sorted(required_ids_set | forced_ids_set):
+        if aid in mec_ids:
+            source = "mec"
+        elif aid in wp_ids:
+            source = "wp_rest"
+        elif aid in event_ids:
+            source = "forced"
+        else:
+            source = "missing"
+        req_flag = "yes" if aid in required_ids_set else "no"
+        forced_flag = "yes" if aid in forced_ids_set else "no"
+        print(f"[discovery_audit] event {aid} source={source} required={req_flag} forced={forced_flag}")
 
     all_rows: List[Dict[str, str]] = []
-    skipped_404 = 0
+    skipped_404_ids: Set[int] = set()
+    rows_per_eid: Dict[int, int] = {}
 
     for eid in sorted(event_ids):
         detail = _fetch_event_detail(cfg, sess, eid)
         if detail is None:
-            skipped_404 += 1
+            skipped_404_ids.add(eid)
+            rows_per_eid[eid] = 0
             continue
         rows = _build_rows_for_event(cfg, detail, occ_hints=occ_map.get(eid))
+        rows_per_eid[eid] = len(rows)
         all_rows.extend(rows)
 
     before = len(all_rows)
     all_rows = _dedupe_rows_global(all_rows)
     after = len(all_rows)
+    skipped_404 = len(skipped_404_ids)
 
-    # strip internal fields before writing
+    # Validate REQUIRED_EVENT_IDS — fail before writing if any required event is missing or empty
+    if required_ids:
+        failures: List[str] = []
+        for rid in required_ids:
+            if rid in skipped_404_ids:
+                failures.append(f"  event {rid}: not found (HTTP 404)")
+            elif rows_per_eid.get(rid, 0) == 0:
+                failures.append(f"  event {rid}: fetched but produced 0 CSV rows")
+        if failures:
+            print("[FAIL] Required event IDs are missing from the generated CSV:")
+            for msg in failures:
+                print(msg)
+            raise SystemExit(1)
+        print(f"[validation] All {len(required_ids)} required event IDs produced rows — OK")
+
+    # Validate MIN_ROW_COUNT — fail before writing if CSV would be too small
+    if min_row_count is not None and after < min_row_count:
+        print(f"[FAIL] CSV row count {after} is below MIN_ROW_COUNT={min_row_count}. Refusing to write.")
+        raise SystemExit(1)
+
+    # Strip internal fields before writing
     for r in all_rows:
         r.pop("_start_ymd", None)
         r.pop("_end_ymd", None)

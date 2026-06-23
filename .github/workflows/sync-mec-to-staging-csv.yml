@@ -86,6 +86,7 @@ jobs:
           POPUP_ALLDAY: "1"
           MEC_DEBUG: "1"
           EXTRA_EVENT_IDS: "25315"
+          MIN_ROW_COUNT: "50"
         run: |
           python scripts/sync_mec_to_csv.py
 

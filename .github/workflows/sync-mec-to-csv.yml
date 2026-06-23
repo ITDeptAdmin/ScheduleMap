@@ -162,7 +162,9 @@ jobs:
           DATE_FORMAT: "mdy"
           POPUP_ALLDAY: "1"
           MEC_DEBUG: "1"
-          EXTRA_EVENT_IDS: "26031"
+          EXTRA_EVENT_IDS: "7573,12666,25579,26819,27702,27700,26031"
+          REQUIRED_EVENT_IDS: "7573,12666,25579,26819"
+          MIN_ROW_COUNT: "130"
         run: |
           python scripts/sync_mec_to_csv.py
 
