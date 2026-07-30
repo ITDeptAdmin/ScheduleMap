@@ -1174,6 +1174,67 @@ def _postprocess_event_rows(rows: List[Dict[str, str]], cfg: Cfg) -> List[Dict[s
     return out
 
 
+def _classify_map_eligibility(
+    detail: Dict[str, Any], rows_count: int, cfg: Cfg
+) -> Tuple[bool, str, str, str]:
+    """
+    Read-only audit classification for the map-eligible zero-row validator.
+
+    Reuses the SAME classification signals _build_rows_for_event() already
+    uses (clinic-type detection via _clinic_type_flags(), and MEC
+    current/repeat-date extraction via _extract_mec_repeat_dates()) so this
+    validator can never diverge from actual row-generation behavior. Never
+    computes or alters rows itself, and is not called from _build_rows_for_event()
+    or anywhere in the row-generation path -- purely an after-the-fact audit.
+
+    Per current row-generation logic:
+    - Popup events ALWAYS produce >=1 row once detail is fetched successfully:
+      _build_rows_for_event() falls back to a single blank-date row when no
+      occurrences are found. So a Popup event is always map-eligible.
+    - Telehealth events produce rows ONLY when current MEC custom/repeat dates
+      exist (_extract_mec_repeat_dates() returns non-empty); this is a
+      deliberate, pre-existing design decision (stale/removed custom dates
+      must not resurrect old occurrences). A Telehealth event with no current
+      custom dates is legitimately NOT map-eligible.
+
+    Returns (map_eligible, event_type_label, expected_date_hint, zero_row_reason).
+    map_eligible=True means this event is expected to have produced >=1 row.
+    zero_row_reason is only meaningful when map_eligible is False.
+    """
+    data = detail.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+
+    fields = _extract_custom_fields(data, whole_detail=detail)
+    tax_text = _extract_taxonomy_text(data)
+    ctype = _clinic_type_flags(fields.get("clinic_type", ""), tax_text)
+    is_telehealth = bool(ctype["telehealth"])
+    event_type = "Telehealth" if is_telehealth else "Popup"
+
+    if not is_telehealth:
+        return True, event_type, "", ""
+
+    if rows_count > 0:
+        # Rows already exist, so current/future custom dates were already
+        # confirmed present by _build_rows_for_event() -- no need to
+        # re-derive them here (avoids a redundant call and duplicate debug
+        # output on the common/healthy path).
+        return True, event_type, "", ""
+
+    # Zero telehealth rows: determine whether this is the documented
+    # legitimate exclusion (no current MEC custom/repeat dates), using the
+    # exact same extraction function _build_rows_for_event() itself calls.
+    explicit_custom = _extract_mec_repeat_dates(detail, cfg=cfg)
+    if not explicit_custom:
+        return False, event_type, "", "expired_no_current_dates"
+
+    # Custom dates DO exist but zero rows were produced anyway -- this
+    # contradicts _build_rows_for_event()'s own logic and indicates a real
+    # regression, not a legitimate exclusion.
+    expected_date = str((explicit_custom[0].get("start") or {}).get("date") or "")
+    return True, event_type, expected_date, ""
+
+
 def _build_rows_for_event(cfg: Cfg, detail: Dict[str, Any], occ_hints: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
     data = detail.get("data", {})
     if not isinstance(data, dict):
@@ -1641,6 +1702,7 @@ def main() -> None:
     all_rows: List[Dict[str, str]] = []
     skipped_404_ids: Set[int] = set()
     rows_per_eid: Dict[int, int] = {}
+    map_eligibility_audit: List[Dict[str, Any]] = []
 
     for eid in sorted(event_ids):
         detail = _fetch_event_detail(cfg, sess, eid)
@@ -1652,6 +1714,24 @@ def main() -> None:
         rows_per_eid[eid] = len(rows)
         all_rows.extend(rows)
 
+        eligible, ev_type, expected_date, reason = _classify_map_eligibility(detail, len(rows), cfg)
+        if eid in mec_ids:
+            eid_source = "mec"
+        elif eid in wp_ids:
+            eid_source = "wp_rest"
+        else:
+            eid_source = "forced"
+        map_eligibility_audit.append({
+            "event_id": eid,
+            "title": str((detail.get("data") or {}).get("title") or "").strip(),
+            "type": ev_type,
+            "source": eid_source,
+            "expected_date": expected_date,
+            "rows": len(rows),
+            "eligible": eligible,
+            "reason": reason,
+        })
+
     before = len(all_rows)
     all_rows = _dedupe_rows_global(all_rows)
     skipped_404 = len(skipped_404_ids)
@@ -1659,6 +1739,32 @@ def main() -> None:
     # Remove cross-event telehealth rows that appear identical on the public schedule card
     all_rows = _postprocess_global_display_duplicates(all_rows, cfg)
     after = len(all_rows)
+
+    # Validate map-eligible zero-row events — fail before writing if a published
+    # RAM event that is currently expected to produce public rows (per the same
+    # classification signals _build_rows_for_event() uses) produced none. Runs
+    # before REQUIRED_EVENT_IDS/MIN_ROW_COUNT, the existing pre-write validations.
+    map_eligible_failures = [a for a in map_eligibility_audit if a["eligible"] and a["rows"] == 0]
+    if map_eligible_failures:
+        print(f"[validation] ERROR: {len(map_eligible_failures)} map-eligible MEC event(s) produced zero CSV rows:")
+        for a in map_eligible_failures:
+            print("[validation] ERROR: map-eligible MEC event produced zero CSV rows")
+            print(f"  Event ID: {a['event_id']}")
+            print(f"  Title: {a['title']}")
+            print(f"  Type: {a['type']}")
+            print(f"  Discovery: {a['source']}")
+            print(f"  Expected date: {a['expected_date'] or '(n/a)'}")
+            print("  Reason: event is map-eligible (per existing row-generation rules) but produced no rows")
+        print("[FAIL] Map-eligible zero-row validation failed. Refusing to write.")
+        raise SystemExit(1)
+
+    _excluded_reasons = sorted({a["reason"] for a in map_eligibility_audit if not a["eligible"] and a["reason"]})
+    print(
+        f"[validation] Map-eligible zero-row check: "
+        f"{sum(1 for a in map_eligibility_audit if a['eligible'])} eligible event(s) all produced rows, "
+        f"{sum(1 for a in map_eligibility_audit if not a['eligible'])} legitimately excluded "
+        f"({', '.join(_excluded_reasons) if _excluded_reasons else 'none'})"
+    )
 
     # Validate REQUIRED_EVENT_IDS — fail before writing if any required event is missing or empty
     if required_ids:
