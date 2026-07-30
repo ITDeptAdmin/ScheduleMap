@@ -16,7 +16,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: "*/30 * * * *" # every 30 minutes
+    - cron: "17,47 * * * *" # every 30 minutes, offset from the busy :00/:30 boundary
 
 permissions:
   contents: write
