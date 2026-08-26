@@ -16,7 +16,38 @@ Visitors can explore clinics through map, list, and calendar views while filteri
 - JavaScript (Papa Parse)
 - Google Analytics 4
 - Looker Studio dashboards
-- 
+
+## Technical Overview
+
+The RAM Schedule Map is a production scheduling and data-delivery system that connects WordPress clinic events to an interactive public-facing map, list, and calendar experience.
+
+The system synchronizes event data from Modern Events Calendar (MEC), processes and publishes the schedule through GitHub-hosted data and automated workflows, and delivers it to a custom WordPress interface built with Mapbox and JavaScript.
+
+### Key Engineering Features
+
+- **Automated MEC → schedule data pipeline** for keeping public clinic information synchronized
+- **GitHub Actions automation** for updating the production schedule dataset
+- **GitHub-hosted CSV architecture** used as the data source for the front-end application
+- **Custom WordPress integration** for rendering upcoming clinic information
+- **Mapbox-powered interactive mapping** with dynamic clinic markers and popups
+- **Map, list, and calendar views** using a shared clinic dataset
+- **JavaScript and Papa Parse** for client-side CSV processing
+- **Dynamic filtering** by state, month, clinic type, and available services
+- **Automatic handling of canceled and expired clinics** in the display layer
+- **Responsive full-page and embedded display modes**
+- **GA4 event instrumentation** for measuring map, filter, clinic, and navigation interactions
+- **Looker Studio reporting** for analyzing clinic interest and user behavior
+
+### System Flow
+
+`WordPress / MEC → Sync Process → GitHub Actions → Schedule CSV → WordPress Plugin → Mapbox Map / List / Calendar`
+
+User engagement follows a separate analytics path:
+
+`Visitor Interaction → GTM / GA4 Events → Custom Dimensions → Looker Studio Reporting`
+
+The architecture separates clinic management from presentation, allowing staff to continue managing events in WordPress while automated workflows keep the public schedule interface synchronized and measurable.
+
 # RAM Schedule Map System (Deep Dive)
 
 This repository and plugin setup power the **RAM Schedule Map** used on the RAM website to display **upcoming clinics** in both map and calendar views.
