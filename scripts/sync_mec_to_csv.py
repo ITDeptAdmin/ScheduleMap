@@ -42,6 +42,9 @@ Optional env vars:
 - INCLUDE_ONGOING "1" include ongoing events (default: 1)
 - POPUP_ALLDAY    "1" blank times for popup clinics (telehealth=No) (default: 1)
 - MEC_DEBUG       "1" to print diagnostics
+- REQUIRE_WP_REST_DISCOVERY  "1" to require WP REST secondary discovery to
+  succeed (404/exception/bad status/bad JSON/zero results all fail the run
+  instead of falling back silently) (default: unset/false)
 """
 
 from __future__ import annotations
@@ -1543,18 +1546,44 @@ def _load_cfg() -> Cfg:
     )
 
 
-def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session) -> Set[int]:
+def _wp_rest_unhealthy(reason: str, strict: bool) -> Set[int]:
+    """Handle a WP REST secondary-discovery failure.
+
+    In strict mode (REQUIRE_WP_REST_DISCOVERY=1) this refuses the run outright,
+    since a production sync must not silently fall back to a degraded
+    discovery source. In non-strict mode it preserves the historical fallback
+    of returning an empty set and letting MEC pagination carry the run alone.
+    """
+    if strict:
+        raise SystemExit(
+            "[FAIL] WP REST secondary discovery is unhealthy "
+            f"({reason}). REQUIRE_WP_REST_DISCOVERY is enabled, so the CSV "
+            "is being refused for safety rather than published from an "
+            "unverified event list."
+        )
+    return set()
+
+
+def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session, strict: bool = False) -> Set[int]:
     """Discover MEC event post IDs via the WordPress REST API.
 
     Tries GET /wp/v2/mec-events?per_page=100&page=N&status=publish.
-    Returns an empty set without failing if the endpoint is unavailable (404)
-    or returns unexpected responses.
+
+    When strict is False (default), returns an empty set without failing if
+    the endpoint is unavailable (404) or returns unexpected responses --
+    preserving historical fallback behavior.
+
+    When strict is True (REQUIRE_WP_REST_DISCOVERY=1), any of the following
+    fail the run instead of falling back silently: a 404 on the endpoint, a
+    request exception, an unexpected HTTP status, a non-list JSON response,
+    or a successful discovery that finds zero published MEC IDs.
     """
     mec_base = cfg.base_url.rstrip("/")
     wp_json_idx = mec_base.lower().find("/wp-json")
     if wp_json_idx == -1:
-        _debug(cfg, "[wp_rest] Cannot derive WP REST base from MEC_BASE_URL; skipping WP REST discovery")
-        return set()
+        msg = "cannot derive WP REST base from MEC_BASE_URL"
+        _debug(cfg, f"[wp_rest] {msg}; skipping WP REST discovery")
+        return _wp_rest_unhealthy(msg, strict)
     wp_json_base = mec_base[: wp_json_idx + len("/wp-json")]
     endpoint = f"{wp_json_base}/wp/v2/mec-events"
 
@@ -1566,28 +1595,36 @@ def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session) -> Set[int]:
         try:
             resp = sess.get(endpoint, params=params, timeout=60)
         except Exception as exc:
-            _debug(cfg, f"[wp_rest] Request error on page {page}: {exc}; stopping WP REST discovery")
-            break
+            msg = f"request exception on page {page}: {exc}"
+            _debug(cfg, f"[wp_rest] {msg}; stopping WP REST discovery")
+            return _wp_rest_unhealthy(msg, strict)
 
         if page == 1 and resp.status_code == 404:
             print("[discovery] WP REST /wp/v2/mec-events returned 404 — endpoint unavailable, skipping")
-            return set()
+            return _wp_rest_unhealthy("endpoint returned HTTP 404", strict)
 
         # WP REST returns 400 when the requested page number exceeds total pages
         if resp.status_code == 400:
             break
 
         if resp.status_code != 200:
-            _debug(cfg, f"[wp_rest] HTTP {resp.status_code} on page {page}; stopping WP REST discovery")
-            break
+            msg = f"unexpected HTTP {resp.status_code} on page {page}"
+            _debug(cfg, f"[wp_rest] {msg}; stopping WP REST discovery")
+            return _wp_rest_unhealthy(msg, strict)
 
         try:
             items = resp.json()
         except Exception:
-            _debug(cfg, f"[wp_rest] Non-JSON response on page {page}; stopping WP REST discovery")
-            break
+            msg = f"non-JSON response on page {page}"
+            _debug(cfg, f"[wp_rest] {msg}; stopping WP REST discovery")
+            return _wp_rest_unhealthy(msg, strict)
 
-        if not isinstance(items, list) or not items:
+        if not isinstance(items, list):
+            msg = f"invalid (non-list) JSON response on page {page}"
+            _debug(cfg, f"[wp_rest] {msg}; stopping WP REST discovery")
+            return _wp_rest_unhealthy(msg, strict)
+
+        if not items:
             break
 
         for item in items:
@@ -1608,6 +1645,9 @@ def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session) -> Set[int]:
             break
 
         page += 1
+
+    if strict and not found_ids:
+        return _wp_rest_unhealthy("discovery succeeded but found zero published MEC IDs", strict)
 
     return found_ids
 
@@ -1648,8 +1688,11 @@ def main() -> None:
     print(f"[discovery] MEC pagination discovered {discovered_count} event IDs")
 
     # Secondary discovery: WordPress REST API post listing
+    require_wp_rest_discovery = (os.environ.get("REQUIRE_WP_REST_DISCOVERY", "") or "").strip().lower() in {"1", "true", "yes", "y"}
+    if require_wp_rest_discovery:
+        print("[cfg] REQUIRE_WP_REST_DISCOVERY=1 -- WP REST secondary discovery must succeed or the run fails")
     mec_ids: Set[int] = set(event_ids)  # snapshot of MEC-only discovery for audit
-    wp_ids = _iter_wp_mec_event_post_ids(cfg, sess)
+    wp_ids = _iter_wp_mec_event_post_ids(cfg, sess, strict=require_wp_rest_discovery)
     wp_missing_from_mec = sorted(wp_ids - mec_ids)
     event_ids.update(wp_ids)
     print(f"[discovery] WP REST post discovery found {len(wp_ids)} event IDs")
@@ -1770,8 +1813,10 @@ def main() -> None:
     if required_ids:
         failures: List[str] = []
         for rid in required_ids:
-            if rid in skipped_404_ids:
-                failures.append(f"  event {rid}: not found (HTTP 404)")
+            if rid not in event_ids:
+                failures.append(f"  event {rid}: not discovered by MEC pagination or WP REST discovery")
+            elif rid in skipped_404_ids:
+                failures.append(f"  event {rid}: discovered but returned HTTP 404 when fetched")
             elif rows_per_eid.get(rid, 0) == 0:
                 failures.append(f"  event {rid}: fetched but produced 0 CSV rows")
         if failures:
