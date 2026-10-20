@@ -1,0 +1,182 @@
+name: Diagnose MEC CSV candidate (read-only)
+
+# Manual-only, READ-ONLY diagnostic. Generates a candidate schedule CSV from MEC with
+# the sync code at an exact commit, validates it with production settings, and
+# compares it with the CSV committed on main and the public website CSV.
+#
+# It cannot publish: contents is read-only, checkout does not persist credentials,
+# there is no commit/push step, and no SFTP/SiteGround secrets are referenced. The
+# candidate is written under diag/ and is only uploaded as a workflow artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fix_sha:
+        description: "Full 40-character commit SHA of the sync code to test"
+        required: true
+        type: string
+      expect_absent:
+        description: "Occurrences that must NOT be in the candidate (slug@YYYY-MM-DD, comma-separated)"
+        required: false
+        default: "sevier-co-food-ministries-telehealth@2026-10-22,rio-townsend-telehealth@2026-12-01"
+        type: string
+      expect_present:
+        description: "Event slugs that MUST be in the candidate (comma-separated)"
+        required: false
+        default: "brookfield-ohio"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-mec-csv-candidate
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Validate fix SHA
+        shell: bash
+        env:
+          FIX_SHA: ${{ inputs.fix_sha }}
+        run: |
+          if ! [[ "$FIX_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: fix_sha must be a full 40-character lowercase commit SHA."
+            exit 1
+          fi
+
+      - name: Checkout exact fix commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.fix_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm checkout and capture baseline from main
+        shell: bash
+        env:
+          FIX_SHA: ${{ inputs.fix_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          mkdir -p diag
+          git show origin/main:"Clinic Master Schedule for git.csv" > diag/baseline_main.csv
+          {
+            echo "fix_sha=$FIX_SHA"
+            echo "baseline=origin/main $(git rev-parse origin/main)"
+            echo "generated_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > diag/provenance.txt
+          cp diag/baseline_main.csv diag/candidate.csv
+          cat diag/provenance.txt
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Build candidate with production validation
+        id: build
+        shell: bash
+        env:
+          MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
+          MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
+          # Keep in sync with the "Build CSV from MEC" step of sync-mec-to-csv.yml,
+          # except CSV_PATH / RECONCILIATION_REPORT_PATH, which point into diag/.
+          CSV_PATH: "diag/candidate.csv"
+          RECONCILIATION_REPORT_PATH: "diag/reconciliation.json"
+          MEC_START: "2010-01-01"
+          MEC_END: "2030-12-31"
+          MEC_LIMIT: "200"
+          MAX_PAGES: "50"
+          MAX_SPAN_DAYS: "10"
+          CSV_DELIMITER: "comma"
+          DATE_FORMAT: "mdy"
+          POPUP_ALLDAY: "1"
+          MEC_DEBUG: "1"
+          EXTRA_EVENT_IDS: ""
+          REQUIRE_WP_REST_DISCOVERY: "1"
+          MIN_ROW_COUNT: "75"
+          MAX_UNEXPLAINED_FUTURE_ROW_LOSS: "2"
+          MAX_FUTURE_ROW_LOSS: "15"
+        run: |
+          set +e
+          python scripts/sync_mec_to_csv.py > diag/sync.log 2>&1
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "sync exit code: $code"
+          grep -E '^\[(discovery|validation|FAIL|global_clean)\]|^Wrote ' diag/sync.log || true
+          exit 0
+
+      - name: Snapshot public website CSV (read-only)
+        shell: bash
+        run: |
+          curl -sS --max-time 60 -D diag/public_headers.txt -o diag/public.csv \
+            "https://www.ramusa.org/schedule-data/clinic-master-schedule.csv?cb=$(date +%s)" || true
+          grep -iE '^(HTTP|last-modified|etag|content-length)' diag/public_headers.txt || true
+
+      - name: Compare candidate
+        id: compare
+        shell: bash
+        env:
+          EXPECT_ABSENT: ${{ inputs.expect_absent }}
+          EXPECT_PRESENT: ${{ inputs.expect_present }}
+        run: |
+          set +e
+          python scripts/compare_schedule_csv.py \
+            --baseline diag/baseline_main.csv --candidate diag/candidate.csv \
+            --public diag/public.csv --reconciliation diag/reconciliation.json \
+            --sync-exit "${{ steps.build.outputs.exit_code }}" \
+            --today "$(TZ=America/New_York date '+%Y-%m-%d')" \
+            --expect-absent "$EXPECT_ABSENT" --expect-present "$EXPECT_PRESENT" \
+            --out-md diag/comparison.md --out-json diag/comparison.json > /dev/null
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          cat diag/comparison.md >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Scrub secrets from diagnostic files
+        shell: bash
+        env:
+          MEC_BASE_URL: ${{ secrets.MEC_BASE_URL }}
+          MEC_TOKEN: ${{ secrets.MEC_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          secrets = [v for v in (os.environ.get("MEC_TOKEN", ""), os.environ.get("MEC_BASE_URL", "").rstrip("/")) if len(v) >= 6]
+          for p in pathlib.Path("diag").rglob("*"):
+              if not p.is_file():
+                  continue
+              data = p.read_bytes()
+              for s in secrets:
+                  data = data.replace(s.encode(), b"***")
+              p.write_bytes(data)
+          token = os.environ.get("MEC_TOKEN", "").encode()
+          leaked = [str(p) for p in pathlib.Path("diag").rglob("*") if p.is_file() and token and token in p.read_bytes()]
+          if leaked:
+              raise SystemExit(f"Refusing to upload: token still present in {leaked}")
+          print("diag/ scrubbed; no token present")
+          PY
+
+      - name: Upload diagnostic artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mec-csv-candidate-${{ inputs.fix_sha }}
+          path: diag/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Report result
+        shell: bash
+        run: |
+          echo "sync exit: ${{ steps.build.outputs.exit_code }}  comparison checks exit: ${{ steps.compare.outputs.exit_code }}"
+          if [ "${{ steps.build.outputs.exit_code }}" != "0" ] || [ "${{ steps.compare.outputs.exit_code }}" != "0" ]; then
+            echo "Candidate did not pass production validation and/or expectation checks. See artifact."
+            exit 1
+          fi
