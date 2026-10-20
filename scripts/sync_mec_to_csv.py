@@ -52,7 +52,8 @@ Optional env vars:
   to write if any is still scheduled in MEC, if unexplained ones exceed
   MAX_UNEXPLAINED_FUTURE_ROW_LOSS, or if all missing ones exceed MAX_FUTURE_ROW_LOSS.
   (default: unset/disabled)
-- RECONCILIATION_REPORT_PATH  optional JSON report path for that comparison
+- RECONCILIATION_REPORT_PATH  diagnostics only: JSON report path for that comparison;
+  the generated rows are also written to <report>_candidate.csv even if validation fails
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -1548,11 +1549,15 @@ def _schedule_evidence(detail: Dict[str, Any]) -> Dict[str, Any]:
     meta = data.get("meta") if isinstance(data, dict) else None
     meta = meta if isinstance(meta, dict) else {}
     backup = meta.get("_ram_telehealth_mec_in_days")
+    mec_tbl = data.get("mec") if isinstance(data, dict) else None
+    mec_tbl = mec_tbl if isinstance(mec_tbl, dict) else {}
     return {
         "in_days": _in_days_dates(meta.get("mec_in_days")),
         "not_in_days": _in_days_dates(meta.get("mec_not_in_days")),
         # RAM plugin's copy of mec_in_days, written on its full schedule saves.
         "plugin_in_days": _in_days_dates(backup) if backup not in (None, "") else None,
+        # MEC's own events-table copy (report only; can lag behind mec_in_days).
+        "mec_table_days": _in_days_dates(mec_tbl.get("days")),
     }
 
 
@@ -1620,7 +1625,16 @@ def _reconcile_future_occurrences(
             status, reason = "explained", "date removed from mec_in_days and the RAM plugin schedule copy"
         else:
             status, reason = "unexplained", "date removed from mec_in_days only (no exclusion record in MEC)"
-        findings.append({"row": r, "status": status, "reason": reason})
+        evidence = {}
+        if ev is not None:
+            plugin = ev["plugin_in_days"]
+            evidence = {
+                "event_mec_in_days": sorted(ev["in_days"]),
+                "in_mec_not_in_days": ymd in ev["not_in_days"],
+                "in_plugin_copy": None if plugin is None else ymd in plugin,
+                "in_mec_events_table": ymd in ev["mec_table_days"],
+            }
+        findings.append({"row": r, "status": status, "reason": reason, "evidence": evidence})
     return findings
 
 
@@ -2044,8 +2058,12 @@ def main() -> None:
             print(
                 f"[validation]   missing ({f['status']}): {r.get('start_date', '')} {r.get('start_time', '')} "
                 f"{r.get('clinic_type', '')} / {r.get('facility', '')} / {r.get('url', '')} -- {f['reason']}"
+                + (f" | evidence: {json.dumps(f['evidence'], sort_keys=True)}" if f["evidence"] else "")
             )
 
+        # Diagnostics only (production does not set this): write the report and a copy of
+        # the generated rows beside it, whether or not validation passes. CSV_PATH is
+        # still written only after every validation succeeds.
         report_path = (os.environ.get("RECONCILIATION_REPORT_PATH", "") or "").strip()
         if report_path:
             with open(report_path, "w", encoding="utf-8") as fh:
@@ -2055,11 +2073,12 @@ def main() -> None:
                     "candidate_rows": after,
                     "pruned_expired": pruned_expired,
                     "missing": [
-                        {"status": f["status"], "reason": f["reason"],
+                        {"status": f["status"], "reason": f["reason"], "evidence": f["evidence"],
                          **{k: f["row"].get(k, "") for k in ("url", "start_date", "start_time", "clinic_type", "facility")}}
                         for f in findings
                     ],
                 }, fh, indent=2)
+            _write_csv(replace(cfg, csv_path=os.path.splitext(report_path)[0] + "_candidate.csv"), all_rows)
 
         failures: List[str] = []
         if by_status["regression"]:
