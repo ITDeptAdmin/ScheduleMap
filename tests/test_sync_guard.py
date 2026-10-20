@@ -16,6 +16,7 @@ import argparse
 import csv
 import importlib.util
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -250,7 +251,7 @@ confirmed = ev_with({
 })
 scenario("confirmed removals pass: Sevier 10/22 explained, RIO 12/1 unexplained within budget", confirmed, 0,
          expect_in_out=["missing (explained): 10/22/2026", "excluded in MEC mec_not_in_days",
-                        "missing (unexplained): 12/1/2026", "1 explained, 1 unexplained"])
+                        "missing (unexplained): 12/1/2026", "1 explained, 0 acknowledged, 1 unexplained"])
 scenario("RIO 12/1 explained if plugin copy also lacks it",
          ev_with({10: {"dates": ["2026-11-03"], "plugin": ["2026-11-03"]}}), 0,
          expect_in_out=["removed from mec_in_days and the RAM plugin schedule copy"])
@@ -273,6 +274,55 @@ corrected = ev_with({
 })
 scenario("after RIO 11/3 is restored in MEC: only the 2 confirmed removals remain and pass", corrected, 0,
          expect_in_out=["2 unexplained (max 2)", "missing (unexplained): 12/1/2026", "missing (unexplained): 10/22/2026"])
+
+# 2b'. Acknowledged one-off removal (event_id + date), modelled on RIO 2026-11-03.
+ACK_DIR = tempfile.mkdtemp(prefix="acks_")
+
+
+def ack_file(entries, name="acks.json", raw=None):
+    path = os.path.join(ACK_DIR, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(raw if raw is not None else json.dumps({"acknowledged": entries}))
+    return path
+
+
+RIO_ACK = {"event_id": 10, "date": "2026-11-03", "url": "https://www.ramusa.org/events/rio-townsend-telehealth/",
+           "evidence": "Workbench row #343 cancelled 11/3 and 12/1"}
+scenario("acknowledged RIO 11/3 + real state passes: 1 acknowledged, 2 unexplained (limits unchanged)", real_state, 0,
+         env={"ACKNOWLEDGED_FUTURE_REMOVALS_FILE": ack_file([RIO_ACK])},
+         expect_in_out=["0 explained, 1 acknowledged, 2 unexplained (max 2)", "missing (acknowledged): 11/3/2026",
+                        "missing (unexplained): 12/1/2026", "missing (unexplained): 10/22/2026"],
+         extra=lambda out, rows: check("  RIO 11/3 and 12/1 and Sevier 10/22 absent; Sevier 11/19 + 12/17 present",
+                                       not any("rio" in r["url"] and r["start_date"] in ("11/3/2026", "12/1/2026") for r in rows)
+                                       and not any("sevier" in r["url"] and r["start_date"] == "10/22/2026" for r in rows)
+                                       and {r["start_date"] for r in rows if "sevier" in r["url"]} == {"11/19/2026", "12/17/2026"}))
+scenario("acknowledgement never bypasses a date MEC still schedules (regression blocks)",
+         ev_with({10: {"dates": ["2026-10-06", "2026-11-03"], "plugin": ["2026-10-06", "2026-11-03", "2026-12-01"]}}), 1,
+         env={"ACKNOWLEDGED_FUTURE_REMOVALS_FILE": ack_file([RIO_ACK], "a2.json")},
+         build=lambda cfg, d, occ_hints=None: [r for r in orig_build(cfg, d, occ_hints=occ_hints) if r["_start_ymd"] != "2026-11-03"],
+         expect_in_out=["missing (regression): 11/3/2026", "still scheduled in MEC but missing from the CSV"])
+scenario("acknowledgement for a different date does not apply (still blocks, reported unused)", real_state, 1,
+         env={"ACKNOWLEDGED_FUTURE_REMOVALS_FILE": ack_file([dict(RIO_ACK, date="2026-11-10")], "a3.json")},
+         expect_in_out=["3 unexplained missing occurrence(s) exceed", "acknowledged removal not needed this run: event 10 2026-11-10"])
+scenario("acknowledgement for a different event ID does not apply", real_state, 1,
+         env={"ACKNOWLEDGED_FUTURE_REMOVALS_FILE": ack_file([dict(RIO_ACK, event_id=26819)], "a4.json")},
+         expect_in_out=["3 unexplained missing occurrence(s) exceed"])
+scenario("acknowledgement with mismatched URL does not apply", real_state, 1,
+         env={"ACKNOWLEDGED_FUTURE_REMOVALS_FILE": ack_file([dict(RIO_ACK, url="https://www.ramusa.org/events/other/")], "a5.json")},
+         expect_in_out=["3 unexplained missing occurrence(s) exceed"])
+scenario("acknowledged removals still count toward MAX_FUTURE_ROW_LOSS", real_state, 1,
+         env={"ACKNOWLEDGED_FUTURE_REMOVALS_FILE": ack_file([RIO_ACK], "a6.json"), "MAX_FUTURE_ROW_LOSS": "2"},
+         expect_in_out=["3 missing current/future occurrence(s) exceed MAX_FUTURE_ROW_LOSS=2"])
+for label, raw in (("not JSON", "{oops"), ("missing evidence", json.dumps({"acknowledged": [{"event_id": 10, "date": "2026-11-03"}]})),
+                   ("bad date", json.dumps({"acknowledged": [{"event_id": 10, "date": "11/3/2026", "evidence": "x"}]})),
+                   ("string event_id", json.dumps({"acknowledged": [{"event_id": "10", "date": "2026-11-03", "evidence": "x"}]}))):
+    scenario(f"malformed acknowledgements file ({label}) fails closed", real_state, 1,
+             env={"ACKNOWLEDGED_FUTURE_REMOVALS_FILE": ack_file(None, f"bad_{label[:3]}.json", raw=raw)},
+             expect_in_out=["Acknowledged-removals file"])
+repo_acks = sync._load_acknowledged_removals(sync.ACK_FILE_DEFAULT)
+check("repository acknowledgement file = exactly event 26819 on 2026-11-03 (RIO Townsend)",
+      list(repo_acks) == [(26819, "2026-11-03")]
+      and repo_acks[(26819, "2026-11-03")]["url"] == "https://www.ramusa.org/events/rio-townsend-telehealth/")
 
 # 2c. Diagnostic candidate copy: written even when validation fails; CSV_PATH untouched.
 tmp = tempfile.mkdtemp()
@@ -313,12 +363,12 @@ code, out = run(sync, Backend(BASE_EVENTS), p)  # all three series unpublished a
 check("18 explained misses in one sync exceed total cap 15 and block",
       code == 1 and "18 missing current/future occurrence(s) exceed MAX_FUTURE_ROW_LOSS=15" in out, out[-600:])
 code, out = run(sync, Backend(BASE_EVENTS + big[:2]), p)  # one series (6) unpublished: within cap
-check("6 explained misses (one whole series unpublished) pass", code == 0 and "6 explained, 0 unexplained" in out, out[-600:])
+check("6 explained misses (one whole series unpublished) pass", code == 0 and "6 explained, 0 acknowledged, 0 unexplained" in out, out[-600:])
 shutil.rmtree(tmp)
 
 # 4. Missing events and detail 404 responses.
 scenario("unpublished Telehealth event (final cancellation -> draft) explained", ev_with({12: None}), 0,
-         expect_in_out=["event no longer published", "3 explained, 0 unexplained"])
+         expect_in_out=["event no longer published", "3 explained, 0 acknowledged, 0 unexplained"])
 scenario("detail 404 for a published event blocks (unexplained > 2)", BASE_EVENTS, 1,
          backend_kw={"detail_404": {11}}, expect_in_out=["a discovered event returned 404"])
 scenario("detail 404 small loss stays within budget but is reported", BASE_EVENTS, 0,

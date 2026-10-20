@@ -52,6 +52,10 @@ Optional env vars:
   to write if any is still scheduled in MEC, if unexplained ones exceed
   MAX_UNEXPLAINED_FUTURE_ROW_LOSS, or if all missing ones exceed MAX_FUTURE_ROW_LOSS.
   (default: unset/disabled)
+- ACKNOWLEDGED_FUTURE_REMOVALS_FILE  JSON of reviewed one-off removals (default:
+  scripts/acknowledged_future_removals.json). Each {event_id, date, evidence} entry turns
+  that exact *unexplained* missing occurrence into "acknowledged" (still counted in
+  MAX_FUTURE_ROW_LOSS); it never overrides a date MEC still schedules. Malformed = fail.
 - RECONCILIATION_REPORT_PATH  diagnostics only: JSON report path for that comparison;
   the generated rows are also written to <report>_candidate.csv even if validation fails
 """
@@ -1634,8 +1638,56 @@ def _reconcile_future_occurrences(
                 "in_plugin_copy": None if plugin is None else ymd in plugin,
                 "in_mec_events_table": ymd in ev["mec_table_days"],
             }
-        findings.append({"row": r, "status": status, "reason": reason, "evidence": evidence})
+        findings.append({"row": r, "status": status, "reason": reason, "evidence": evidence,
+                         "event_id": (ev or {}).get("event_id"), "date": ymd})
     return findings
+
+
+ACK_FILE_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "acknowledged_future_removals.json")
+
+
+def _load_acknowledged_removals(path: str) -> Dict[Tuple[int, str], Dict[str, Any]]:
+    """Load reviewed one-off removals {(event_id, YYYY-MM-DD): entry}. Missing file = none.
+
+    A malformed file fails the run rather than being ignored.
+    """
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            entries = json.load(fh).get("acknowledged", [])
+        acks: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        for e in entries:
+            eid, d = e["event_id"], str(e["date"])
+            if not isinstance(eid, int) or not _YMD_RE.match(d) or not str(e.get("evidence", "")).strip():
+                raise ValueError(f"invalid entry {e!r}")
+            acks[(eid, d)] = e
+        return acks
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        print(f"[FAIL] Acknowledged-removals file {path} is malformed ({exc}). Refusing to write.")
+        raise SystemExit(1)
+
+
+def _apply_acknowledged_removals(
+    findings: List[Dict[str, Any]], acks: Dict[Tuple[int, str], Dict[str, Any]]
+) -> List[Tuple[int, str]]:
+    """Relabel matching *unexplained* findings as acknowledged; return unused ack keys.
+
+    Only unexplained findings for the exact event ID and date qualify. A date that MEC
+    still schedules (regression) is never acknowledged.
+    """
+    used: Set[Tuple[int, str]] = set()
+    for f in findings:
+        key = (f.get("event_id"), f.get("date"))
+        ack = acks.get(key)
+        if f["status"] != "unexplained" or ack is None:
+            continue
+        if ack.get("url") and _row_url({"url": ack["url"]}) != _row_url(f["row"]):
+            continue
+        f["status"] = "acknowledged"
+        f["reason"] = f"acknowledged removal ({ack.get('evidence', '').strip()[:160]})"
+        used.add(key)
+    return sorted(k for k in acks if k not in used)
 
 
 def _read_baseline_csv(cfg: Cfg) -> List[Dict[str, str]]:
@@ -1953,7 +2005,7 @@ def main() -> None:
             continue
         permalink = str((detail.get("data") or {}).get("permalink") or "").strip().lower()
         if permalink:
-            evidence_by_url[permalink] = _schedule_evidence(detail)
+            evidence_by_url[permalink] = {**_schedule_evidence(detail), "event_id": eid}
         rows = _build_rows_for_event(cfg, detail, occ_hints=occ_map.get(eid))
         rows_per_eid[eid] = len(rows)
         all_rows.extend(rows)
@@ -2041,15 +2093,19 @@ def main() -> None:
         findings = _reconcile_future_occurrences(
             baseline_rows, all_rows, evidence_by_url, today, any_detail_404=bool(skipped_404_ids)
         )
+        ack_path = (os.environ.get("ACKNOWLEDGED_FUTURE_REMOVALS_FILE", "") or "").strip() or ACK_FILE_DEFAULT
+        unused_acks = _apply_acknowledged_removals(findings, _load_acknowledged_removals(ack_path))
         new_occ = {(_row_url(r), _row_start(r)) for r in all_rows}
         pruned_expired = sum(
             1 for r in baseline_rows if _row_is_expired(r, today) and (_row_url(r), _row_start(r)) not in new_occ
         )
-        by_status = {s: sum(1 for f in findings if f["status"] == s) for s in ("explained", "unexplained", "regression")}
+        by_status = {s: sum(1 for f in findings if f["status"] == s)
+                     for s in ("explained", "acknowledged", "unexplained", "regression")}
         print(
             f"[validation] Reconciliation vs baseline CSV (today={today.isoformat()}): "
             f"{len(baseline_rows)} -> {after} rows; {pruned_expired} expired row(s) pruned (allowed); "
             f"{len(findings)} current/future occurrence(s) missing: {by_status['explained']} explained, "
+            f"{by_status['acknowledged']} acknowledged, "
             f"{by_status['unexplained']} unexplained (max {max_unexplained}), "
             f"{by_status['regression']} still scheduled in MEC (max 0); total max {max_future_loss}"
         )
@@ -2060,6 +2116,9 @@ def main() -> None:
                 f"{r.get('clinic_type', '')} / {r.get('facility', '')} / {r.get('url', '')} -- {f['reason']}"
                 + (f" | evidence: {json.dumps(f['evidence'], sort_keys=True)}" if f["evidence"] else "")
             )
+        for eid_ack, d_ack in unused_acks:
+            print(f"[validation]   acknowledged removal not needed this run: event {eid_ack} {d_ack} "
+                  f"(not missing, or not unexplained); safe to delete from {os.path.basename(ack_path)}")
 
         # Diagnostics only (production does not set this): write the report and a copy of
         # the generated rows beside it, whether or not validation passes. CSV_PATH is

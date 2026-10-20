@@ -210,7 +210,8 @@ jobs:
           # rows never count. Missing current/future occurrences are matched by exact
           # event/date and explained from MEC data; any still scheduled in MEC always blocks.
           # Unexplained = removed from mec_in_days with no MEC exclusion record (e.g. a
-          # plugin cancellation before its next full schedule save).
+          # plugin cancellation before its next full schedule save). Reviewed one-off
+          # removals are listed in scripts/acknowledged_future_removals.json.
           MAX_UNEXPLAINED_FUTURE_ROW_LOSS: "2"
           # All missing current/future occurrences (explained + unexplained) in one sync.
           MAX_FUTURE_ROW_LOSS: "15"
