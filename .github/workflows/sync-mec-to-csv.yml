@@ -28,7 +28,7 @@ concurrency:
 # Set to "true" to allow scheduled runs to commit, push, and upload.
 # Keep "false" while testing to prevent the every-30-minute schedule from writing to production.
 env:
-  ALLOW_SCHEDULED_PRODUCTION_SYNC: "false"
+  ALLOW_SCHEDULED_PRODUCTION_SYNC: "true"
 
 jobs:
   sync:
