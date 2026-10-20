@@ -62,14 +62,30 @@ jobs:
           FIX_SHA: ${{ inputs.fix_sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          # The commit must be on a branch of this repository (not only reachable as a fork/PR ref).
+          BRANCHES="$(git branch -r --contains "$FIX_SHA" | sed 's/^ *//' | grep -v -- '->' || true)"
+          if [ -z "$BRANCHES" ]; then
+            echo "ERROR: $FIX_SHA is not contained in any branch of this repository."
+            exit 1
+          fi
           mkdir -p diag
-          git show origin/main:"Clinic Master Schedule for git.csv" > diag/baseline_main.csv
+          CSV="Clinic Master Schedule for git.csv"
+          git show "origin/main:$CSV" > diag/baseline_main.csv
+          # Baseline must be the committed production CSV, non-empty, with the expected header.
+          test -s diag/baseline_main.csv
+          head -n 1 diag/baseline_main.csv | tr -d '\r' | grep -qx 'canceled,lat,lng,address,city,state,site,title,facility,clinic_type,telehealth,start_time,end_time,start_date,end_date,parking_date,parking_time,medical,dental,vision,dentures,url'
+          test "$(git hash-object --no-filters diag/baseline_main.csv)" = "$(git rev-parse "origin/main:$CSV")"
+          cp diag/baseline_main.csv diag/candidate.csv
+          cmp diag/baseline_main.csv diag/candidate.csv
           {
             echo "fix_sha=$FIX_SHA"
+            echo "fix_sha_branches=$(echo $BRANCHES | tr ' ' ',')"
             echo "baseline=origin/main $(git rev-parse origin/main)"
+            echo "baseline_blob=$(git rev-parse "origin/main:$CSV")"
+            echo "baseline_last_commit=$(git log -1 --format='%H %cI' origin/main -- "$CSV")"
+            echo "baseline_data_rows=$(( $(python3 -c 'import csv,sys; print(sum(1 for _ in csv.reader(open(sys.argv[1], newline="", encoding="utf-8"))))' diag/baseline_main.csv) - 1 ))"
             echo "generated_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           } > diag/provenance.txt
-          cp diag/baseline_main.csv diag/candidate.csv
           cat diag/provenance.txt
 
       - name: Setup Python
