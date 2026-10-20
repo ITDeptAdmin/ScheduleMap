@@ -28,7 +28,7 @@ concurrency:
 # Set to "true" to allow scheduled runs to commit, push, and upload.
 # Keep "false" while testing to prevent the every-30-minute schedule from writing to production.
 env:
-  ALLOW_SCHEDULED_PRODUCTION_SYNC: "true"
+  ALLOW_SCHEDULED_PRODUCTION_SYNC: "false"
 
 jobs:
   sync:
@@ -203,7 +203,17 @@ jobs:
           MEC_DEBUG: "1"
           EXTRA_EVENT_IDS: ""
           REQUIRE_WP_REST_DISCOVERY: "1"
-          MIN_ROW_COUNT: "130"
+          # Catastrophic floor only. Telehealth dates are pruned daily after they pass,
+          # so total rows drift; occurrence loss is guarded by the two settings below.
+          MIN_ROW_COUNT: "75"
+          # Compared against the committed CSV (must exist and be well-formed). Past-dated
+          # rows never count. Missing current/future occurrences are matched by exact
+          # event/date and explained from MEC data; any still scheduled in MEC always blocks.
+          # Unexplained = removed from mec_in_days with no MEC exclusion record (e.g. a
+          # plugin cancellation before its next full schedule save).
+          MAX_UNEXPLAINED_FUTURE_ROW_LOSS: "2"
+          # All missing current/future occurrences (explained + unexplained) in one sync.
+          MAX_FUTURE_ROW_LOSS: "15"
         run: |
           python scripts/sync_mec_to_csv.py
 

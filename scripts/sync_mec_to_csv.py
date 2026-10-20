@@ -45,11 +45,20 @@ Optional env vars:
 - REQUIRE_WP_REST_DISCOVERY  "1" to require WP REST secondary discovery to
   succeed (404/exception/bad status/bad JSON/zero results all fail the run
   instead of falling back silently) (default: unset/false)
+- MAX_UNEXPLAINED_FUTURE_ROW_LOSS / MAX_FUTURE_ROW_LOSS  ints; compare against the
+  existing CSV (which must then exist and be well-formed). Past-dated rows are
+  legitimate expiry and never count. Each current/future occurrence missing from
+  the new rows (exact event/date match) is explained from current MEC data; refuse
+  to write if any is still scheduled in MEC, if unexplained ones exceed
+  MAX_UNEXPLAINED_FUTURE_ROW_LOSS, or if all missing ones exceed MAX_FUTURE_ROW_LOSS.
+  (default: unset/disabled)
+- RECONCILIATION_REPORT_PATH  optional JSON report path for that comparison
 """
 
 from __future__ import annotations
 
 import csv
+import json
 import os
 import re
 import time
@@ -1486,6 +1495,167 @@ def _postprocess_global_display_duplicates(rows: List[Dict[str, str]], cfg: Cfg)
     return out
 
 
+def _today_site() -> date:
+    """Today's date in RAM's site timezone (America/New_York); UTC if tzdata is unavailable."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return datetime.utcnow().date()
+
+
+def _row_date(value: str) -> Optional[date]:
+    """Parse a row date in either YYYY-MM-DD (internal/ymd) or M/D/YYYY (mdy CSV) form."""
+    s = (value or "").strip()
+    d = _parse_ymd(s)
+    if d or not s:
+        return d
+    try:
+        return datetime.strptime(s, "%m/%d/%Y").date()
+    except Exception:
+        return None
+
+
+def _row_is_expired(r: Dict[str, str], today: date) -> bool:
+    """True when the row's last date is before today. Undated rows are never treated as expired."""
+    end = _row_date(r.get("_end_ymd") or r.get("end_date") or "") or _row_date(
+        r.get("_start_ymd") or r.get("start_date") or ""
+    )
+    return bool(end and end < today)
+
+
+def _row_url(r: Dict[str, str]) -> str:
+    return (r.get("url") or "").strip().lower()
+
+
+def _row_start(r: Dict[str, str]) -> Optional[date]:
+    return _row_date(r.get("_start_ymd") or r.get("start_date") or "")
+
+
+def _in_days_dates(raw: Any) -> Set[str]:
+    """YYYY-MM-DD dates from an MEC custom-days string ('d:d:hh-mm-AM:hh-mm-PM,...' or 'd,d')."""
+    out: Set[str] = set()
+    for entry in str(raw or "").split(","):
+        d = entry.strip().split(":")[0].strip()
+        if _YMD_RE.match(d):
+            out.add(d)
+    return out
+
+
+def _schedule_evidence(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """Current MEC schedule fields used to explain a missing occurrence (no row generation)."""
+    data = detail.get("data") or {}
+    meta = data.get("meta") if isinstance(data, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    backup = meta.get("_ram_telehealth_mec_in_days")
+    return {
+        "in_days": _in_days_dates(meta.get("mec_in_days")),
+        "not_in_days": _in_days_dates(meta.get("mec_not_in_days")),
+        # RAM plugin's copy of mec_in_days, written on its full schedule saves.
+        "plugin_in_days": _in_days_dates(backup) if backup not in (None, "") else None,
+    }
+
+
+def _reconcile_future_occurrences(
+    baseline_rows: Sequence[Dict[str, str]],
+    new_rows: Sequence[Dict[str, str]],
+    evidence_by_url: Dict[str, Dict[str, Any]],
+    today: date,
+    *,
+    any_detail_404: bool,
+) -> List[Dict[str, Any]]:
+    """Find current/future baseline occurrences missing from the new rows, and explain each.
+
+    Matching is exact, not a net count:
+      - Telehealth: (event URL, date). A time change on the same date is not a loss; a
+        date-display duplicate merged under another event URL (same facility/date/time)
+        is not a loss.
+      - Popup: the event URL must still have a row (its range may change).
+    Rows dated before today are legitimate expiry/pruning and are never examined.
+
+    Each missing occurrence is classified from current MEC data:
+      regression  - MEC still schedules the date (mec_in_days) but the CSV lacks it
+      explained   - event no longer published, or date in mec_not_in_days, or the date
+                    is gone from both mec_in_days and the RAM plugin's schedule copy
+      unexplained - anything else (e.g. removed from mec_in_days only)
+    """
+    new_by_url: Dict[str, List[Dict[str, str]]] = {}
+    display_keys: Set[Tuple[str, Optional[date], str]] = set()
+    for r in new_rows:
+        new_by_url.setdefault(_row_url(r), []).append(r)
+        display_keys.add(
+            ((r.get("facility") or "").strip().lower(), _row_start(r), (r.get("start_time") or "").strip().lower())
+        )
+
+    findings: List[Dict[str, Any]] = []
+    for r in baseline_rows:
+        if _row_is_expired(r, today):
+            continue
+        url = _row_url(r)
+        d = _row_start(r)
+        is_telehealth = (r.get("telehealth") or "").strip().lower() == "yes"
+        candidates = new_by_url.get(url, [])
+        if is_telehealth:
+            if any(_row_start(c) == d for c in candidates):
+                continue
+            if ((r.get("facility") or "").strip().lower(), d, (r.get("start_time") or "").strip().lower()) in display_keys:
+                continue
+        elif candidates:
+            continue
+
+        ymd = d.isoformat() if d else ""
+        ev = evidence_by_url.get(url)
+        if ev is None:
+            if any_detail_404:
+                status, reason = "unexplained", "event not fetched and a discovered event returned 404"
+            else:
+                status, reason = "explained", "event no longer published (absent from MEC and WP REST discovery)"
+        elif not is_telehealth:
+            status, reason = "unexplained", "Popup event still published but produced no current row"
+        elif ymd in ev["in_days"]:
+            status, reason = "regression", "date still scheduled in MEC mec_in_days but missing from CSV"
+        elif ymd in ev["not_in_days"]:
+            status, reason = "explained", "date excluded in MEC mec_not_in_days"
+        elif ev["plugin_in_days"] is not None and ymd not in ev["plugin_in_days"]:
+            status, reason = "explained", "date removed from mec_in_days and the RAM plugin schedule copy"
+        else:
+            status, reason = "unexplained", "date removed from mec_in_days only (no exclusion record in MEC)"
+        findings.append({"row": r, "status": status, "reason": reason})
+    return findings
+
+
+def _read_baseline_csv(cfg: Cfg) -> List[Dict[str, str]]:
+    """Read the CSV about to be replaced (the last committed/published version).
+
+    Fails the run if it is missing, unreadable or malformed, because the
+    occurrence-loss check cannot be trusted without it.
+    """
+    def fail(why: str) -> None:
+        print(f"[FAIL] Baseline CSV {cfg.csv_path} {why}; occurrence-loss check cannot run. Refusing to write.")
+        raise SystemExit(1)
+
+    if not os.path.isfile(cfg.csv_path):
+        fail("is missing")
+    try:
+        with open(cfg.csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f, delimiter=cfg.delimiter)
+            header = list(reader.fieldnames or [])
+            rows = []
+            for r in reader:
+                if None in r or any(v is None for v in r.values()):
+                    fail(f"is malformed (wrong field count near line {reader.line_num})")
+                if (r.get("start_date") or "").strip() and _row_date(r["start_date"]) is None:
+                    fail(f"is malformed (unparseable start_date near line {reader.line_num})")
+                rows.append(r)
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        fail(f"is unreadable ({exc.__class__.__name__})")
+    if header != DEFAULT_HEADER:
+        fail("is malformed (unexpected header)")
+    if not rows:
+        fail("is malformed (no data rows)")
+    return rows
+
+
 def _write_csv(cfg: Cfg, rows: Sequence[Dict[str, str]]) -> None:
     os.makedirs(os.path.dirname(cfg.csv_path) or ".", exist_ok=True)
     with open(cfg.csv_path, "w", encoding="utf-8", newline="") as f:
@@ -1576,7 +1746,8 @@ def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session, strict: bool =
     When strict is True (REQUIRE_WP_REST_DISCOVERY=1), any of the following
     fail the run instead of falling back silently: a 404 on the endpoint, a
     request exception, an unexpected HTTP status, a non-list JSON response,
-    or a successful discovery that finds zero published MEC IDs.
+    or a successful discovery that finds zero published MEC IDs, or a count that
+    disagrees with the X-WP-Total header.
     """
     mec_base = cfg.base_url.rstrip("/")
     wp_json_idx = mec_base.lower().find("/wp-json")
@@ -1588,6 +1759,7 @@ def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session, strict: bool =
     endpoint = f"{wp_json_base}/wp/v2/mec-events"
 
     found_ids: Set[int] = set()
+    expected_total: Optional[int] = None
     page = 1
 
     while True:
@@ -1636,6 +1808,12 @@ def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session, strict: bool =
                     except (ValueError, TypeError):
                         pass
 
+        if page == 1:
+            try:
+                expected_total = int(resp.headers.get("X-WP-Total", ""))
+            except (ValueError, TypeError):
+                expected_total = None
+
         # Honour X-WP-TotalPages to avoid unnecessary requests
         try:
             total_pages = int(resp.headers.get("X-WP-TotalPages", "0"))
@@ -1648,6 +1826,11 @@ def _iter_wp_mec_event_post_ids(cfg: Cfg, sess: requests.Session, strict: bool =
 
     if strict and not found_ids:
         return _wp_rest_unhealthy("discovery succeeded but found zero published MEC IDs", strict)
+
+    if strict and expected_total is not None and len(found_ids) != expected_total:
+        return _wp_rest_unhealthy(
+            f"found {len(found_ids)} published MEC IDs but X-WP-Total reported {expected_total}", strict
+        )
 
     return found_ids
 
@@ -1746,6 +1929,7 @@ def main() -> None:
     skipped_404_ids: Set[int] = set()
     rows_per_eid: Dict[int, int] = {}
     map_eligibility_audit: List[Dict[str, Any]] = []
+    evidence_by_url: Dict[str, Dict[str, Any]] = {}
 
     for eid in sorted(event_ids):
         detail = _fetch_event_detail(cfg, sess, eid)
@@ -1753,6 +1937,9 @@ def main() -> None:
             skipped_404_ids.add(eid)
             rows_per_eid[eid] = 0
             continue
+        permalink = str((detail.get("data") or {}).get("permalink") or "").strip().lower()
+        if permalink:
+            evidence_by_url[permalink] = _schedule_evidence(detail)
         rows = _build_rows_for_event(cfg, detail, occ_hints=occ_map.get(eid))
         rows_per_eid[eid] = len(rows)
         all_rows.extend(rows)
@@ -1825,6 +2012,66 @@ def main() -> None:
                 print(msg)
             raise SystemExit(1)
         print(f"[validation] All {len(required_ids)} required event IDs produced rows — OK")
+
+    # Validate future-occurrence losses against the CSV being replaced. Rows dated before
+    # today are legitimate expiry/pruning and never count. Each missing current/future
+    # occurrence is matched exactly and explained from current MEC data (see
+    # _reconcile_future_occurrences); MEC-still-scheduled losses always block.
+    max_unexplained_raw = (os.environ.get("MAX_UNEXPLAINED_FUTURE_ROW_LOSS", "") or "").strip()
+    max_future_loss_raw = (os.environ.get("MAX_FUTURE_ROW_LOSS", "") or "").strip()
+    if max_unexplained_raw or max_future_loss_raw:
+        max_unexplained = int(max_unexplained_raw) if max_unexplained_raw else None
+        max_future_loss = int(max_future_loss_raw) if max_future_loss_raw else None
+        baseline_rows = _read_baseline_csv(cfg)
+        today = _today_site()
+        findings = _reconcile_future_occurrences(
+            baseline_rows, all_rows, evidence_by_url, today, any_detail_404=bool(skipped_404_ids)
+        )
+        new_occ = {(_row_url(r), _row_start(r)) for r in all_rows}
+        pruned_expired = sum(
+            1 for r in baseline_rows if _row_is_expired(r, today) and (_row_url(r), _row_start(r)) not in new_occ
+        )
+        by_status = {s: sum(1 for f in findings if f["status"] == s) for s in ("explained", "unexplained", "regression")}
+        print(
+            f"[validation] Reconciliation vs baseline CSV (today={today.isoformat()}): "
+            f"{len(baseline_rows)} -> {after} rows; {pruned_expired} expired row(s) pruned (allowed); "
+            f"{len(findings)} current/future occurrence(s) missing: {by_status['explained']} explained, "
+            f"{by_status['unexplained']} unexplained (max {max_unexplained}), "
+            f"{by_status['regression']} still scheduled in MEC (max 0); total max {max_future_loss}"
+        )
+        for f in findings:
+            r = f["row"]
+            print(
+                f"[validation]   missing ({f['status']}): {r.get('start_date', '')} {r.get('start_time', '')} "
+                f"{r.get('clinic_type', '')} / {r.get('facility', '')} / {r.get('url', '')} -- {f['reason']}"
+            )
+
+        report_path = (os.environ.get("RECONCILIATION_REPORT_PATH", "") or "").strip()
+        if report_path:
+            with open(report_path, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "today": today.isoformat(),
+                    "baseline_rows": len(baseline_rows),
+                    "candidate_rows": after,
+                    "pruned_expired": pruned_expired,
+                    "missing": [
+                        {"status": f["status"], "reason": f["reason"],
+                         **{k: f["row"].get(k, "") for k in ("url", "start_date", "start_time", "clinic_type", "facility")}}
+                        for f in findings
+                    ],
+                }, fh, indent=2)
+
+        failures: List[str] = []
+        if by_status["regression"]:
+            failures.append(f"{by_status['regression']} occurrence(s) are still scheduled in MEC but missing from the CSV")
+        if max_unexplained is not None and by_status["unexplained"] > max_unexplained:
+            failures.append(f"{by_status['unexplained']} unexplained missing occurrence(s) exceed MAX_UNEXPLAINED_FUTURE_ROW_LOSS={max_unexplained}")
+        if max_future_loss is not None and len(findings) > max_future_loss:
+            failures.append(f"{len(findings)} missing current/future occurrence(s) exceed MAX_FUTURE_ROW_LOSS={max_future_loss}")
+        if failures:
+            for msg in failures:
+                print(f"[FAIL] {msg}. Refusing to write.")
+            raise SystemExit(1)
 
     # Validate MIN_ROW_COUNT — fail before writing if CSV would be too small
     if min_row_count is not None and after < min_row_count:
