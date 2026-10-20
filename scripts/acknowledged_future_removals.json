@@ -1,0 +1,12 @@
+{
+  "_comment": "Reviewed one-off removals for sync_mec_to_csv.py. Each entry turns one exact unexplained missing occurrence (event_id + date) into 'acknowledged'. It still counts toward MAX_FUTURE_ROW_LOSS and never overrides a date MEC still schedules in mec_in_days. Entries are inert once the date is no longer in the committed CSV; the sync log reports unused entries so they can be deleted.",
+  "acknowledged": [
+    {
+      "event_id": 26819,
+      "date": "2026-11-03",
+      "url": "https://www.ramusa.org/events/rio-townsend-telehealth/",
+      "recorded": "2026-10-20",
+      "evidence": "RAM Schedule Workbench, Event ID 26819 (RIO Townsend Telehealth), supplied by the owner 2026-10-20: Smartsheet row #343 covers 2026-11-03 and 2026-12-01 with OCRF status Cancelled; rows #329 and #339 report both dates cancellation-blocked by row #343; row #343 notes removed dates must be re-added manually if needed. 2026-12-01 is also owner-confirmed removed and is counted as unexplained within MAX_UNEXPLAINED_FUTURE_ROW_LOSS."
+    }
+  ]
+}
