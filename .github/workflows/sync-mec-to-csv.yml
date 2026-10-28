@@ -27,6 +27,12 @@ concurrency:
 
 # Set to "true" to allow scheduled runs to commit, push, and upload.
 # Keep "false" while testing to prevent the every-30-minute schedule from writing to production.
+#
+# Website writer switch: the repository variable MAP_CSV_WEBSITE_WRITER decides who uploads the
+# public CSV to the RAM website. Unset (default) = this workflow uploads it, as before.
+# "wordpress" = the RAM Schedule plugin publishes it, so the "Upload CSV to RAM website" step is
+# skipped on every run (scheduled, manual and upload-only). The CSV is still built, committed and
+# pushed to main for the chatbot either way.
 env:
   ALLOW_SCHEDULED_PRODUCTION_SYNC: "true"
 
@@ -265,8 +271,12 @@ jobs:
           git commit -m "Sync MEC events -> MAIN schedule CSV"
           git push origin HEAD:main
 
+      - name: Website upload skipped (WordPress publishes the public CSV)
+        if: github.ref == 'refs/heads/main' && vars.MAP_CSV_WEBSITE_WRITER == 'wordpress' && (inputs.dry_run != 'true' || inputs.upload_existing_csv_only == true) && (github.event_name != 'schedule' || env.ALLOW_SCHEDULED_PRODUCTION_SYNC == 'true')
+        run: echo "::notice title=Website upload skipped::MAP_CSV_WEBSITE_WRITER=wordpress - the RAM Schedule plugin publishes the website CSV. The CSV was still committed to main for the chatbot."
+
       - name: Upload CSV to RAM website
-        if: github.ref == 'refs/heads/main' && (inputs.dry_run != 'true' || inputs.upload_existing_csv_only == true) && (github.event_name != 'schedule' || env.ALLOW_SCHEDULED_PRODUCTION_SYNC == 'true')
+        if: github.ref == 'refs/heads/main' && vars.MAP_CSV_WEBSITE_WRITER != 'wordpress' && (inputs.dry_run != 'true' || inputs.upload_existing_csv_only == true) && (github.event_name != 'schedule' || env.ALLOW_SCHEDULED_PRODUCTION_SYNC == 'true')
         env:
           SFTP_PROD_HOST: ${{ secrets.SFTP_PROD_HOST }}
           SFTP_PROD_PORT: ${{ secrets.SFTP_PROD_PORT }}
